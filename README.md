@@ -1,5 +1,6 @@
 # ktables
 
+[![PyPI](https://img.shields.io/pypi/v/ktables)](https://pypi.org/project/ktables/)
 [![Tests](https://github.com/ryan-yuuu/ktables/actions/workflows/test.yml/badge.svg)](https://github.com/ryan-yuuu/ktables/actions/workflows/test.yml)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -42,12 +43,8 @@ with provenance, in the module docstring of
 
 ## Install
 
-ktables is not yet published to PyPI. Until the first release, vendor the
-package — copy the `ktables/` directory into your project — and install its
-single runtime dependency:
-
 ```sh
-$ pip install aiokafka
+pip install ktables
 ```
 
 Requires Python 3.10+. Pydantic is **not** required — the `.json()` presets
