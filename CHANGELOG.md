@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.2](https://github.com/ryan-yuuu/ktables/compare/v0.1.1...v0.1.2) (2026-06-10)
+
+
+### Bug Fixes
+
+* ship py.typed so type checkers use the package's inline annotations ([#6](https://github.com/ryan-yuuu/ktables/issues/6)) ([e556fb4](https://github.com/ryan-yuuu/ktables/commit/e556fb414b9a9ec723a18deeea5a16fa9f382006))
+
 ## [0.1.1](https://github.com/ryan-yuuu/ktables/compare/v0.1.0...v0.1.1) (2026-06-10)
 
 
