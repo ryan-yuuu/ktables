@@ -1,5 +1,6 @@
 # ktables
 
+[![PyPI](https://img.shields.io/pypi/v/ktables)](https://pypi.org/project/ktables/)
 [![Tests](https://github.com/ryan-yuuu/ktables/actions/workflows/test.yml/badge.svg)](https://github.com/ryan-yuuu/ktables/actions/workflows/test.yml)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
@@ -13,6 +14,8 @@ Built for small, broadly-needed reference data — service registries,
 capability advertisements, feature flags, config maps — not for large or
 high-churn state.
 
+<br>
+
 ## Table of Contents
 
 - [Background](#background)
@@ -22,6 +25,8 @@ high-churn state.
 - [API](#api)
 - [Contributing](#contributing)
 - [License](#license)
+
+<br>
 
 ## Background
 
@@ -40,18 +45,18 @@ catch-up gating against end offsets, compaction independence) are documented,
 with provenance, in the module docstring of
 [`kafka_table.py`](./ktables/kafka_table.py).
 
+<br>
+
 ## Install
 
-ktables is not yet published to PyPI. Until the first release, vendor the
-package — copy the `ktables/` directory into your project — and install its
-single runtime dependency:
-
 ```sh
-$ pip install aiokafka
+pip install ktables
 ```
 
 Requires Python 3.10+. Pydantic is **not** required — the `.json()` presets
 accept any class with pydantic-v2's JSON methods.
+
+<br>
 
 ## Usage
 
@@ -108,6 +113,8 @@ compacted). If the application lacks topic-create ACLs, pass
 `ensure_topic=False` and create the topic out-of-band (the module-level
 `ensure_topic()` function is the deploy-time primitive).
 
+<br>
+
 ## Consistency contract
 
 `KafkaTable` is eventually consistent. Precisely:
@@ -128,6 +135,8 @@ If the background reader dies (non-retriable error, e.g. authorization),
 contents freeze at the last applied state: `status` becomes `"failed"` and
 `failure` holds the exception — gate liveness decisions on `status`, never on
 reads alone. Transient broker outages do not kill the reader; it resumes.
+
+<br>
 
 ## API
 
@@ -172,18 +181,23 @@ the same partition.
 | `SupportsJsonModel` | Protocol the `.json()` presets require (`model_dump_json` / `model_validate_json`). |
 | `TableStatus` | The `status` literal type. |
 
+<br>
+
 ## Contributing
 
-Questions and bug reports are welcome as issues, and PRs are accepted. Please
-run the test suite before submitting:
+Questions and bug reports are welcome as issues, and PRs are accepted. The
+repo is developed with [uv](https://docs.astral.sh/uv/); please run the test
+suite before submitting:
 
 ```sh
-$ pytest tests
+$ uv run pytest tests
 ```
 
 Unit tests always run; integration tests need a Kafka broker on
 `localhost:9092` and skip otherwise
 (`docker run -d -p 9092:9092 apache/kafka:3.9.0`).
+
+<br>
 
 ## License
 
