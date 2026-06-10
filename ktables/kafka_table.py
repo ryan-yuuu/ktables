@@ -43,8 +43,8 @@ from types import MappingProxyType
 from typing import TYPE_CHECKING, Generic, Literal, Protocol, TypeVar
 
 if TYPE_CHECKING:
-    # Annotation-only (PEP 563 lazy annotations): no runtime import, so no
-    # typing_extensions runtime dependency on Python 3.10.
+    # Annotation-only (lazy annotations): no runtime typing_extensions
+    # dependency on 3.10.
     from typing_extensions import Self
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRecord, TopicPartition
@@ -205,10 +205,8 @@ class KafkaTable(Mapping[str, V]):
         self._key_decoder = key_decoder
         self._catchup_timeout = catchup_timeout
         self._poll_timeout_ms = poll_timeout_ms
-        # Explicit ensure on start (idempotent, correct config) — lets reader
-        # or writer come up first in dev with no ordering. Disable on
-        # locked-down clusters where the app lacks topic-create ACLs; the free
-        # module-level ensure_topic() remains the deploy-time primitive.
+        # Idempotent ensure on start: reader or writer may come up first.
+        # Disable where the app lacks topic-create ACLs (see ensure_topic()).
         self._ensure_topic = ensure_topic
         self._topic_configs = dict(topic_configs) if topic_configs is not None else dict(DEFAULT_TOPIC_CONFIGS)
 
@@ -224,9 +222,8 @@ class KafkaTable(Mapping[str, V]):
 
     # -- read API (Mapping) ----------------------------------------------------
 
-    # Mapping injects contents-based __eq__ and sets __hash__ = None; a running
-    # table is a resource handle, so restore identity semantics explicitly
-    # (two tables with momentarily equal contents are not "the same table").
+    # Mapping injects contents-__eq__ and __hash__=None; a table is a
+    # resource handle, so restore identity semantics.
     def __eq__(self, other: object) -> bool:
         return self is other
 
@@ -301,10 +298,8 @@ class KafkaTable(Mapping[str, V]):
         """
         if self._failure is not None:
             return False
-        # Wait on catch-up OR reader death, whichever first — a death must wake
-        # this immediately, not burn the rest of the timeout as false-degraded.
-        # No shield: cancelling waiters on timeout is correct and harmless —
-        # catch-up progress lives in the reader task, not here.
+        # Race catch-up against reader death so a death wakes this
+        # immediately. No shield: cancelling these waiters is harmless.
         caught = asyncio.ensure_future(self._caught_up.wait())
         failed = asyncio.ensure_future(self._failed.wait())
         try:
@@ -332,11 +327,10 @@ class KafkaTable(Mapping[str, V]):
             raise RuntimeError(f"KafkaTable for topic={self._topic!r} already started")
         if self._ensure_topic:
             await ensure_topic(self._bootstrap_servers, self._topic, topic_configs=self._topic_configs)
-        # Pass the topic to the constructor: with group_id=None, aiokafka's
-        # NoGroupCoordinator assigns ALL partitions synchronously inside
-        # start() — no group coordinator, no commits, no rebalance, full
-        # replay every boot. (Manual assign()+partitions_for_topic() is a
-        # trap: stale partition-cache for fresh topics.)
+        # Constructor topic + group_id=None: all partitions are assigned
+        # synchronously inside start() — no group, no commits, no rebalance.
+        # (Manual assign()+partitions_for_topic() hits a stale partition
+        # cache on fresh topics.)
         consumer = AIOKafkaConsumer(
             self._topic,
             bootstrap_servers=self._bootstrap_servers,
@@ -353,13 +347,10 @@ class KafkaTable(Mapping[str, V]):
                     f"topic {self._topic!r}: no partitions assigned. Topic missing — or, if ensure_topic ran, "
                     "check the ensure_topic log above for a masked creation error (e.g. ACLs)."
                 )
-            # Belt-and-suspenders over auto_offset_reset="earliest": makes the
-            # replay-from-zero intent explicit and unconditional. Do not
-            # "simplify" away — reset-to-earliest only applies on the
-            # no-valid-position path.
+            # Keep: auto_offset_reset only covers the no-valid-position
+            # path; this makes replay-from-zero unconditional.
             await consumer.seek_to_beginning(*tps)
-            # Gate target: high-water marks at start. Records past this
-            # snapshot are "live updates", not catch-up.
+            # Gate target: HWM at start; later records are live updates.
             end_offsets: dict[TopicPartition, int] = await consumer.end_offsets(tps)
         except BaseException:
             await consumer.stop()
@@ -407,9 +398,8 @@ class KafkaTable(Mapping[str, V]):
             except asyncio.CancelledError:
                 pass
             except Exception:
-                # Already recorded + logged by _on_reader_done; never let a
-                # dead reader turn teardown into a throwing call that masks
-                # the caller's own exception and skips consumer cleanup.
+                # Logged by _on_reader_done; re-raising here would mask
+                # caller errors and skip consumer cleanup.
                 pass
         consumer, self._consumer = self._consumer, None
         if consumer is not None:
@@ -447,8 +437,7 @@ class KafkaTable(Mapping[str, V]):
         try:
             self._data[key] = self._value_decoder(record.value)
         except Exception:
-            # Poison tolerance: a bad record must not kill the table; the
-            # previous good value for the key (if any) is retained.
+            # Poison tolerance: keep the prior value, never kill the reader.
             self._live.value_decode_errors += 1
             logger.exception("undecodable value skipped (key=%s, %s)", key, where)
             return
@@ -461,20 +450,17 @@ class KafkaTable(Mapping[str, V]):
         end_offsets: dict[TopicPartition, int],
         started: float,
     ) -> None:
-        # Any exception escaping this loop is captured by _on_reader_done
-        # (status="failed", loud log). Transient broker outages do NOT raise —
-        # aiokafka retries internally and getmany just returns empty batches.
+        # Escaping exceptions are captured by _on_reader_done (status
+        # "failed"); transient outages don't raise — getmany returns empty.
         while True:
             batches = await consumer.getmany(timeout_ms=self._poll_timeout_ms)
             for records in batches.values():
                 for record in records:
                     self._apply(record)
             if not self._caught_up.is_set():
-                # NoGroupCoordinator auto-assigns NEW partitions on metadata
-                # change (verified in aiokafka source: "Partition changes will
-                # be noticed by metadata update and assigned"). While catching
-                # up, extend the gate to cover them; after the latch, their
-                # replay simply arrives as live updates.
+                # aiokafka auto-assigns new partitions on metadata change;
+                # pre-latch, extend the gate — post-latch they arrive as
+                # live updates.
                 current = consumer.assignment()
                 if current and set(tps) != current:
                     new = sorted(current - set(tps), key=lambda tp: tp.partition)
