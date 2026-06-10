@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.1](https://github.com/ryan-yuuu/ktables/compare/v0.1.0...v0.1.1) (2026-06-10)
+
+
+### Documentation
+
+* update README for published package (pip install, PyPI badge, summary sync) ([#4](https://github.com/ryan-yuuu/ktables/issues/4)) ([466e676](https://github.com/ryan-yuuu/ktables/commit/466e67693caf9a72057e7684314355d300d4a70a))
+
 ## 0.1.0 (2026-06-10)
 
 
