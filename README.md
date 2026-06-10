@@ -171,11 +171,12 @@ the same partition.
 
 ## Contributing
 
-Questions and bug reports are welcome as issues, and PRs are accepted. Please
-run the test suite before submitting:
+Questions and bug reports are welcome as issues, and PRs are accepted. The
+repo is developed with [uv](https://docs.astral.sh/uv/); please run the test
+suite before submitting:
 
 ```sh
-$ pytest tests
+$ uv run pytest tests
 ```
 
 Unit tests always run; integration tests need a Kafka broker on
