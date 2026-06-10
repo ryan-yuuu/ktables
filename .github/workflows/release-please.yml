@@ -11,7 +11,32 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
+        id: release
         with:
           release-type: python
+
+  # Chained here because releases created with GITHUB_TOKEN do not fire
+  # `on: release` in other workflows (GitHub recursion guard).
+  publish:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.release_created == 'true' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ktables/
+    permissions:
+      id-token: write  # OIDC trusted publishing
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - uses: astral-sh/setup-uv@v7
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

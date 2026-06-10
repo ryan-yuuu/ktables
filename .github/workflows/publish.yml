@@ -1,18 +1,29 @@
 name: Publish to PyPI
 
+# Manual fallback / re-publish path. Automatic publishing on each release is
+# chained inside release-please.yml (GITHUB_TOKEN-created releases cannot
+# trigger `on: release` here). Run with the tag to publish, e.g. v0.1.0.
+
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.0)"
+        required: true
 
 jobs:
   pypi:
     runs-on: ubuntu-latest
-    environment: pypi
+    environment:
+      name: pypi
+      url: https://pypi.org/project/ktables/
     permissions:
-      id-token: write  # OIDC for PyPI trusted publishing — no API token needed
+      id-token: write  # OIDC trusted publishing
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+      - uses: astral-sh/setup-uv@v7
       - name: Build sdist and wheel
         run: uv build
       - name: Publish
