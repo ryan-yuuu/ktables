@@ -10,16 +10,20 @@ broker on localhost:9092 and are skipped, loudly, when none is reachable:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
+import types
 import uuid
 from datetime import datetime, timezone
 
 import pytest
+from aiokafka import AIOKafkaConsumer, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient
-from aiokafka.errors import IllegalStateError, KafkaError
+from aiokafka.errors import IllegalStateError, KafkaError, TopicAlreadyExistsError
 from pydantic import AwareDatetime, BaseModel
 
 from ktables import KafkaTable, KafkaTableWriter, ViewStats
+from ktables.kafka_table import ensure_topic
 
 BOOTSTRAP = "localhost:9092"
 
@@ -457,3 +461,341 @@ async def test_barrier_accounts_for_decode_skipped_records(topic: str) -> None:
         assert table["good"].revision == 1
         assert "poison" not in table
         assert table._barriers == []
+
+
+# ---------------------------------------------------------------------------
+# ensure_topic — validation, idempotency, error propagation (mocked admin)
+# ---------------------------------------------------------------------------
+#
+# The broker reachable in CI does NOT reliably raise TopicAlreadyExistsError on
+# a rapid second create_topics (KRaft acks the create before it propagates), so
+# the already-exists / re-raise branches can't be driven by a real double-call —
+# they're exercised against a fake admin client instead.
+
+
+class _FakeAdmin:
+    """Stand-in for AIOKafkaAdminClient: ``create_topics`` does whatever
+    ``on_create`` dictates, and ``close`` records that the ``finally`` ran."""
+
+    def __init__(self, on_create) -> None:
+        self._on_create = on_create
+        self.closed = False
+
+    async def start(self) -> None:
+        pass
+
+    async def create_topics(self, topics) -> None:
+        self._on_create()
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class TestEnsureTopic:
+    async def test_rejects_non_positive_partitions_and_rf(self) -> None:
+        # Validation runs before any admin client is constructed — no broker.
+        with pytest.raises(ValueError, match=">= 1"):
+            await ensure_topic(BOOTSTRAP, "t", num_partitions=0)
+        with pytest.raises(ValueError, match=">= 1"):
+            await ensure_topic(BOOTSTRAP, "t", replication_factor=0)
+
+    async def test_already_exists_returns_false_and_closes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def already_exists() -> None:
+            raise TopicAlreadyExistsError()
+
+        admin = _FakeAdmin(already_exists)
+        monkeypatch.setattr("ktables.kafka_table.AIOKafkaAdminClient", lambda **kw: admin)
+        assert await ensure_topic(BOOTSTRAP, "t") is False
+        assert admin.closed  # finally: the client is always closed
+
+    async def test_unexpected_error_is_reraised_and_closes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def boom() -> None:
+            raise RuntimeError("create_topics failed")
+
+        admin = _FakeAdmin(boom)
+        monkeypatch.setattr("ktables.kafka_table.AIOKafkaAdminClient", lambda **kw: admin)
+        with pytest.raises(RuntimeError, match="create_topics failed"):
+            await ensure_topic(BOOTSTRAP, "t")
+        assert admin.closed  # finally still runs on the re-raise path
+
+
+# ---------------------------------------------------------------------------
+# Read-API surface & introspection — private-state driven, no broker
+# ---------------------------------------------------------------------------
+
+
+class TestIntrospectionUnit:
+    def test_topic_failure_and_is_caught_up_properties(self) -> None:
+        table = make_table("unit.props")
+        assert table.topic == "unit.props"
+        assert table.failure is None
+        assert table.is_caught_up is False
+
+    def test_iter_over_started_table_yields_keys(self) -> None:
+        table = make_table("unit.iter")
+        table._started = True  # bypass start(); __iter__ just walks _data
+        table._data = {"a": 1, "b": 2}  # type: ignore[dict-item]  # values irrelevant to iteration
+        assert sorted(table) == ["a", "b"]
+
+    def test_status_reports_loading_then_degraded(self) -> None:
+        table = make_table("unit.status")
+        table._started = True
+        assert table.status == "loading"
+        table._timed_out = True
+        assert table.status == "degraded"
+
+    async def test_wait_until_caught_up_returns_false_when_reader_dead(self) -> None:
+        table = make_table("unit.deadwait")
+        table._failure = RuntimeError("reader already dead")
+        assert await table.wait_until_caught_up(timeout=0.1) is False
+
+
+# ---------------------------------------------------------------------------
+# _on_reader_done — the task done-callback, called directly
+# ---------------------------------------------------------------------------
+
+
+class TestReaderDoneCallbackUnit:
+    def test_clean_completion_records_no_failure(self) -> None:
+        table = make_table("unit.donecb")
+
+        class _Task:
+            def cancelled(self) -> bool:
+                return False
+
+            def exception(self) -> BaseException | None:
+                return None
+
+        table._on_reader_done(_Task())  # type: ignore[arg-type]
+        assert table.failure is None
+        assert table.status == "unstarted"
+
+    def test_cancelled_task_is_ignored(self) -> None:
+        table = make_table("unit.donecancel")
+
+        class _Task:
+            def cancelled(self) -> bool:
+                return True
+
+            def exception(self) -> BaseException | None:
+                raise AssertionError("exception() must not be read for a cancelled task")
+
+        table._on_reader_done(_Task())  # type: ignore[arg-type]
+        assert table.failure is None
+
+
+# ---------------------------------------------------------------------------
+# stop() — idempotency & teardown edge paths, no broker
+# ---------------------------------------------------------------------------
+
+
+class TestStopLifecycleUnit:
+    async def test_stop_on_unstarted_table_is_noop(self) -> None:
+        table = make_table("unit.stop")
+        await table.stop()  # task is None and consumer is None — both short-circuits
+        assert table._task is None and table._consumer is None
+
+    async def test_stop_cancels_pending_and_skips_already_done_barriers(self) -> None:
+        table = make_table("unit.stopbar")
+        loop = asyncio.get_running_loop()
+        done: asyncio.Future[None] = loop.create_future()
+        done.set_result(None)
+        pending: asyncio.Future[None] = loop.create_future()
+        table._barriers = [({}, done), ({}, pending)]
+        await table.stop()
+        assert pending.cancelled()  # pending barrier is cancelled to unblock its waiter
+        assert not done.cancelled()  # already-done barrier is left alone
+        assert table._barriers == []
+
+    async def test_stop_swallows_consumer_stop_failure(self) -> None:
+        table = make_table("unit.stoperr")
+
+        class _BadConsumer:
+            async def stop(self) -> None:
+                raise RuntimeError("consumer.stop blew up")
+
+        table._consumer = _BadConsumer()  # type: ignore[assignment]
+        await table.stop()  # the error is logged, not raised, and the handle is cleared
+        assert table._consumer is None
+
+
+# ---------------------------------------------------------------------------
+# _apply — keyless and undecodable-key skips, no broker
+# ---------------------------------------------------------------------------
+
+
+def _fake_record(*, key: bytes | None, value: bytes | None, partition: int = 0, offset: int = 0):
+    """A minimal stand-in for ConsumerRecord — _apply only reads these four."""
+    return types.SimpleNamespace(key=key, value=value, partition=partition, offset=offset)
+
+
+class TestApplyUnit:
+    def test_keyless_record_is_skipped_and_counted(self) -> None:
+        table = make_table("unit.apply.keyless")
+        table._apply(_fake_record(key=None, value=b"{}"))  # type: ignore[arg-type]
+        assert table.stats.keyless_records == 1
+        assert len(table._data) == 0
+
+    def test_undecodable_key_is_skipped_and_counted(self) -> None:
+        def bad_key(b: bytes) -> str:
+            raise ValueError("undecodable key")
+
+        table = KafkaTable(bootstrap_servers=BOOTSTRAP, topic="unit.apply.badkey", value_decoder=bytes, key_decoder=bad_key)
+        table._apply(_fake_record(key=b"\xff\xfe", value=b"x"))  # type: ignore[arg-type]
+        assert table.stats.key_decode_errors == 1
+        assert len(table._data) == 0
+
+
+# ---------------------------------------------------------------------------
+# Reader loop — gate extension & barrier sweep, driven via a stub consumer
+# ---------------------------------------------------------------------------
+
+
+class _StubConsumer:
+    """The slice of AIOKafkaConsumer the reader loop touches. ``getmany`` yields
+    (so the test's poller can observe state and the loop never starves); the
+    log is empty and all positions sit at the gate, so the table latches fast."""
+
+    def __init__(self, assignment: set[TopicPartition]) -> None:
+        self._assignment = assignment
+
+    async def getmany(self, timeout_ms: int):
+        await asyncio.sleep(0)
+        return {}
+
+    def assignment(self) -> set[TopicPartition]:
+        return set(self._assignment)
+
+    async def end_offsets(self, partitions):
+        return {tp: 0 for tp in partitions}
+
+    async def position(self, tp: TopicPartition) -> int:
+        return 0
+
+
+async def _run_reader_until(table, consumer, tps, end_offsets, predicate) -> None:
+    """Drive ``table._run`` as a task until ``predicate()`` holds, then cancel."""
+    task = asyncio.create_task(table._run(consumer, tps, dict(end_offsets), 0.0))
+    try:
+        assert await eventually(predicate), "reader-loop predicate never held"
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+class TestReaderLoopUnit:
+    async def test_gate_extends_to_late_assigned_partitions(self) -> None:
+        # The start-time gate knows only p0; the loop discovers p1 in the live
+        # assignment and extends the gate to it before latching.
+        table = make_table("unit.expand")
+        table._started = True
+        p0 = TopicPartition("unit.expand", 0)
+        p1 = TopicPartition("unit.expand", 1)
+        consumer = _StubConsumer({p0, p1})
+        await _run_reader_until(table, consumer, [p0], {p0: 0}, lambda: table.is_caught_up)
+        assert table.is_caught_up
+
+    async def test_gate_tolerates_transient_assignment_shrink(self) -> None:
+        # The gate spans p0 & p1 but the loop momentarily sees only p0: the
+        # "new partitions" set is empty, so the gate is left as-is (no re-fetch).
+        table = make_table("unit.shrink")
+        table._started = True
+        p0 = TopicPartition("unit.shrink", 0)
+        p1 = TopicPartition("unit.shrink", 1)
+        consumer = _StubConsumer({p0})
+        await _run_reader_until(table, consumer, [p0, p1], {p0: 0, p1: 0}, lambda: table.is_caught_up)
+        assert table.is_caught_up
+
+    async def test_sweep_drops_cancelled_and_already_done_barriers(self) -> None:
+        # A cancelled barrier is dropped (continue); an already-resolved barrier
+        # whose target is met is dropped without a redundant set_result.
+        table = make_table("unit.sweep")
+        table._started = True
+        p0 = TopicPartition("unit.sweep", 0)
+        loop = asyncio.get_running_loop()
+        cancelled: asyncio.Future[None] = loop.create_future()
+        cancelled.cancel()
+        done: asyncio.Future[None] = loop.create_future()
+        done.set_result(None)
+        table._barriers = [({p0: 0}, cancelled), ({p0: 0}, done)]
+        consumer = _StubConsumer({p0})
+        await _run_reader_until(table, consumer, [p0], {p0: 0}, lambda: table._barriers == [])
+        assert cancelled.cancelled() and done.done()
+
+
+# ---------------------------------------------------------------------------
+# start() edge paths — real start() with induced broker conditions
+# ---------------------------------------------------------------------------
+
+
+class TestStartEdgePaths:
+    async def test_start_skips_ensure_topic_when_disabled(self, topic: str) -> None:
+        await ensure_topic(BOOTSTRAP, topic)  # pre-create: the table won't ensure it
+        table = KafkaTable.json(bootstrap_servers=BOOTSTRAP, topic=topic, model=ServiceRecord, ensure_topic=False)
+        async with table:
+            assert table.status == "caught_up"
+
+    async def test_start_raises_and_cleans_up_when_no_partitions(self, topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        # An empty assignment after consumer.start() means the topic is missing
+        # (or ensure was masked): start() must raise and tear the consumer down.
+        monkeypatch.setattr(AIOKafkaConsumer, "assignment", lambda self: set())
+        table = make_table(topic)
+        with pytest.raises(RuntimeError, match="no partitions assigned"):
+            await table.start()
+        assert table._consumer is None  # except-BaseException cleanup ran
+
+    async def test_start_raises_when_reader_dies_during_catchup(self, topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        async def boom(self, *args, **kwargs):
+            raise RuntimeError("induced reader death")
+
+        monkeypatch.setattr(AIOKafkaConsumer, "getmany", boom)
+        table = make_table(topic)
+        with pytest.raises(RuntimeError, match="died during catch-up"):
+            await table.start()
+        assert table.status == "failed"
+
+    async def test_start_degrades_when_catchup_times_out(self, topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Inflate the start-time end offsets so the gate is never reachable; with
+        # a tight catchup_timeout, start() returns DEGRADED rather than crashing.
+        real = AIOKafkaConsumer.end_offsets
+
+        async def inflated(self, partitions, *args, **kwargs):
+            offsets = await real(self, partitions)
+            return {tp: off + 10_000 for tp, off in offsets.items()}
+
+        monkeypatch.setattr(AIOKafkaConsumer, "end_offsets", inflated)
+        table = KafkaTable.json(bootstrap_servers=BOOTSTRAP, topic=topic, model=ServiceRecord, catchup_timeout=0.5)
+        async with table:
+            assert table.status == "degraded"
+
+
+# ---------------------------------------------------------------------------
+# KafkaTableWriter — repr, lifecycle guards, ensure-topic toggle
+# ---------------------------------------------------------------------------
+
+
+class TestWriterUnit:
+    def test_repr_reflects_unstarted_state(self) -> None:
+        writer = make_writer("unit.wrepr")
+        text = repr(writer)
+        assert "unit.wrepr" in text and "started=False" in text
+
+    async def test_double_start_raises(self) -> None:
+        writer = make_writer("unit.wstart")
+        writer._producer = object()  # type: ignore[assignment]  # simulate a started producer
+        with pytest.raises(RuntimeError, match="already started"):
+            await writer.start()
+
+    async def test_stop_on_unstarted_writer_is_noop(self) -> None:
+        writer = make_writer("unit.wstop")
+        await writer.stop()  # producer is None — short-circuits
+        assert writer._producer is None
+
+
+class TestWriterEnsureTopicDisabled:
+    async def test_start_skips_ensure_topic_when_disabled(self, topic: str) -> None:
+        await ensure_topic(BOOTSTRAP, topic)  # pre-create: the writer won't ensure it
+        writer = KafkaTableWriter.json(bootstrap_servers=BOOTSTRAP, topic=topic, model=ServiceRecord, ensure_topic=False)
+        async with writer:
+            await writer.set("k", make_record("k", 1))
