@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/ryan-yuuu/ktables/compare/v0.1.2...v0.2.0) (2026-06-13)
+
+
+### Features
+
+* add KafkaTable.barrier() — on-demand read-your-own-writes ([#8](https://github.com/ryan-yuuu/ktables/issues/8)) ([7a46433](https://github.com/ryan-yuuu/ktables/commit/7a464331d9430a9657535cccbdf484fec04d0c85))
+
 ## [0.1.2](https://github.com/ryan-yuuu/ktables/compare/v0.1.1...v0.1.2) (2026-06-10)
 
 
