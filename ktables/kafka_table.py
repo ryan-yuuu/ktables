@@ -52,7 +52,7 @@ if TYPE_CHECKING:
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRecord, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
-from aiokafka.errors import KafkaError, TopicAlreadyExistsError
+from aiokafka.errors import IllegalStateError, KafkaError, TopicAlreadyExistsError
 
 logger = logging.getLogger(__name__)
 
@@ -558,23 +558,36 @@ class KafkaTable(Mapping[str, V]):
                     self._caught_up.set()
             if self._barriers:
                 # Read positions only for partitions that some pending barrier
-                # targets. Each was assigned (and end_offsets-queried) at its
-                # barrier's call time, and assignment is GROW-ONLY under
-                # group_id=None, so it is still assigned now — position() will
-                # not raise IllegalStateError (which would kill the reader). We
-                # never read position() for a brand-new partition outside any
-                # barrier's contract. position() is read here, in the same
-                # coroutine that runs _apply and after it, so "positions
-                # reached => records applied" holds by construction.
+                # targets, in the same coroutine that runs _apply and after it,
+                # so "positions reached => records applied" holds by
+                # construction. Assignment is grow-only under group_id=None
+                # EXCEPT for transient shrinks: a metadata blip can momentarily
+                # empty the assignment, making position() raise
+                # IllegalStateError. Catch it and omit that tp (its barrier
+                # defers via the .get(tp, -1) default below) rather than letting
+                # a blip aiokafka self-heals from kill the reader for good.
                 needed = {tp for targets, _ in self._barriers for tp in targets}
-                barrier_positions = {tp: await consumer.position(tp) for tp in needed}
-                # INVARIANT: no await between reading self._barriers here and
-                # the rebind below — that keeps the append/rebind discipline
-                # race-free; an await reopens lost-append / cancelled-re-add.
+                barrier_positions: dict[TopicPartition, int] = {}
+                for tp in needed:
+                    try:
+                        barrier_positions[tp] = await consumer.position(tp)
+                    except IllegalStateError:
+                        pass  # transiently unassigned: defer barriers needing tp
+                # INVARIANT: the authoritative read is the `for` loop below, and
+                # there is no await between it and the rebind, so the
+                # read-modify-write of self._barriers is atomic w.r.t. the event
+                # loop. The awaits above are the only yield points: a barrier
+                # appended (or self-pruned) during them is still seen by the for
+                # loop, and if its target is absent from barrier_positions it
+                # defers via the .get(tp, -1) default below.
                 still_pending: list[tuple[dict[TopicPartition, int], asyncio.Future[None]]] = []
                 for targets, fut in self._barriers:
                     if fut.cancelled():
                         continue  # timed-out / caller-cancelled: drop, never re-add
+                    # .get(tp, -1): a target tp can be absent from
+                    # barrier_positions — a barrier appended during the awaits
+                    # above, or a tp whose position() raised and was skipped; -1
+                    # fails the >= check and defers, never resolving on missing data.
                     if all(barrier_positions.get(tp, -1) >= off for tp, off in targets.items()):
                         if not fut.done():
                             fut.set_result(None)

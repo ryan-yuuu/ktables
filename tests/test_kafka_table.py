@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 
 import pytest
 from aiokafka.admin import AIOKafkaAdminClient
-from aiokafka.errors import KafkaError
+from aiokafka.errors import IllegalStateError, KafkaError
 from pydantic import AwareDatetime, BaseModel
 
 from ktables import KafkaTable, KafkaTableWriter, ViewStats
@@ -402,3 +402,58 @@ async def test_barrier_returns_false_when_stop_races_the_wait(topic: str, monkey
     finally:
         if table._consumer is not None:
             await table.stop()
+
+
+async def test_barrier_returns_false_immediately_when_reader_already_dead(topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # The reader-already-dead fast-path (distinct from death *during* the wait):
+    # barrier() must short-circuit to False at the _failure check, before it
+    # snapshots end offsets or registers — so nothing is ever queued.
+    async with make_table(topic) as table:
+        async def boom(*args, **kwargs):
+            raise RuntimeError("induced reader death")
+
+        monkeypatch.setattr(table._consumer, "getmany", boom)
+        assert await eventually(lambda: table.status == "failed")
+        assert await table.barrier(timeout=5) is False
+        assert table._barriers == []  # never registered — short-circuited
+
+
+async def test_barrier_survives_transient_position_unavailability(topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A metadata blip can momentarily empty the assignment under group_id=None,
+    # making consumer.position() raise IllegalStateError. The reader must
+    # tolerate it (not die) and the barrier must still resolve once positions
+    # are readable again. Without the catch, the first raise kills the reader
+    # and the barrier returns False.
+    async with make_table(topic) as table, make_writer(topic) as writer:
+        await writer.set("k", make_record("k", 1))
+        real_position = table._consumer.position
+        calls = {"n": 0}
+
+        async def flaky_position(tp):
+            calls["n"] += 1
+            if calls["n"] <= 2:  # simulate the transient-shrink window
+                raise IllegalStateError(f"Partition {tp} is not assigned")
+            return await real_position(tp)
+
+        monkeypatch.setattr(table._consumer, "position", flaky_position)
+        assert await table.barrier(timeout=10) is True
+        assert table.status != "failed"  # reader survived the transient raise
+        assert table._barriers == []
+
+
+async def test_barrier_accounts_for_decode_skipped_records(topic: str) -> None:
+    # The docstring guarantees that on True, every acked record is visible "or
+    # counted in stats as decode-skipped". A poison value sits below the
+    # barrier's target: the reader advances past it (counting the skip), so the
+    # barrier still resolves and the good record after it shows immediately.
+    # (Keyless records aren't covered here: a compacted topic rejects null-key
+    # records broker-side, so that path can't arise on a table-shaped topic.)
+    async with make_table(topic) as table, make_writer(topic) as writer:
+        await writer._require_producer().send_and_wait(topic, value=b"{not json", key=b"poison")
+        await writer.set("good", make_record("good", 1))
+        assert await table.barrier() is True
+        # Immediately, no eventually(): the skip is accounted for, not lost.
+        assert table.stats.value_decode_errors >= 1
+        assert table["good"].revision == 1
+        assert "poison" not in table
+        assert table._barriers == []
