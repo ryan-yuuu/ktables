@@ -5,6 +5,13 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   unit:
     runs-on: ubuntu-latest
@@ -64,3 +71,39 @@ jobs:
           exit 1
       - name: Run full suite against the aiokafka floor
         run: uv run --python 3.13 --with 'aiokafka==0.13.0' pytest -rs
+
+  coverage:
+    # Reports the test coverage badge/data, single-version on purpose: the
+    # matrix `unit` job is the test gate, while exactly one job owns coverage so
+    # the parallel legs don't race to write the data branch. Runs unit-only
+    # (integration auto-skips without a broker) for a deterministic number with
+    # no external service. python-coverage-comment-action commits the badge +
+    # coverage data to its own `python-coverage-comment-action-data` branch on
+    # pushes to main and posts the coverage comment on same-repo PRs; the
+    # companion `coverage.yml` posts it for fork / Dependabot PRs.
+    runs-on: ubuntu-latest
+    # Elevated for THIS job only (the workflow default is `contents: read`).
+    permissions:
+      contents: write       # commit badge + data to the data branch
+      pull-requests: write  # post / update the coverage comment
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - name: Run unit tests with coverage
+        # Coverage config lives in pyproject.toml ([tool.coverage.run]); this
+        # writes the .coverage file the action consumes below.
+        run: uv run --python 3.12 pytest -q --cov --cov-report=term-missing
+      - name: Coverage comment
+        id: coverage_comment
+        uses: py-cov-action/python-coverage-comment-action@v3
+        with:
+          GITHUB_TOKEN: ${{ github.token }}
+          # Thresholds set badge colour only; they do NOT gate CI.
+          MINIMUM_GREEN: 90
+          MINIMUM_ORANGE: 70
+      - name: Store coverage comment (for fork / Dependabot PRs)
+        uses: actions/upload-artifact@v4
+        if: steps.coverage_comment.outputs.COMMENT_FILE_WRITTEN == 'true'
+        with:
+          name: python-coverage-comment-action
+          path: python-coverage-comment-action.txt
