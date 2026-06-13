@@ -130,6 +130,26 @@ compacted). If the application lacks topic-create ACLs, pass
 4. Correctness does not depend on broker-side compaction: last-write-wins
    over the full log yields the same dict; compaction only bounds replay time.
 
+### On-demand read-your-own-writes: `barrier()`
+
+When you need guarantee #2 *now* — e.g. you just published a record and must
+read it back consistently — `await table.barrier()` closes the gap:
+
+```python
+await writer.set("billing", record)
+if await table.barrier():        # waits until the table has caught up
+    record = table["billing"]    # guaranteed visible
+```
+
+`barrier()` snapshots the topic's end offsets at call time and returns once the
+reader has consumed **and applied** every record below them (on the partitions
+assigned at the call), so every write acked before the call is then visible. It
+returns a `bool`, never raising for environmental conditions: `True` once fresh;
+`False` on `timeout` (bounds the whole call), reader death, `stop()` racing the
+wait, or a broker error while snapshotting. It raises `RuntimeError` only on
+lifecycle misuse (table never started, or already stopped). Runtime partition
+expansion is out of scope — the guarantee covers the call-time assignment.
+
 A tombstone is a record with a **null** value (`b""` is data, not a tombstone).
 If the background reader dies (non-retriable error, e.g. authorization),
 contents freeze at the last applied state: `status` becomes `"failed"` and
@@ -152,6 +172,7 @@ reads alone. Transient broker outages do not kill the reader; it resumes.
 | `status` | `"unstarted" \| "loading" \| "caught_up" \| "degraded" \| "failed"`. |
 | `failure` | Exception that killed the reader, else `None`. |
 | `is_caught_up` / `wait_until_caught_up(timeout=None)` | Catch-up gate; the wait returns `False` on timeout or reader death. |
+| `barrier(timeout=None)` | On-demand read-your-own-writes: `True` once every write acked before the call is visible; `False` on timeout/reader death/`stop()`/broker-snapshot error. Raises only on lifecycle misuse. |
 | `stats` | Frozen `ViewStats` snapshot (see below). |
 
 Equality is **identity** and instances are hashable: a running table is a

@@ -26,7 +26,10 @@ Consistency contract (the four guarantees):
 3. Contents are stable between *your* awaits (single event loop; only the
    reader task mutates). ``snapshot()`` for copies you hold across awaits.
 4. NO read-your-own-writes: after ``await writer.set(k, v)``, a local
-   ``table.get(k)`` may return the old value until the broker round trip.
+   ``table.get(k)`` may return the old value until the broker round trip —
+   unless you ``await table.barrier()`` first, the on-demand freshness/RYOW
+   primitive (it proves visibility of every record acked before the call, on
+   the partitions assigned at call time).
 
 See README.md for usage. Integration tests need a Kafka broker on
 localhost:9092: ``pytest tests``.
@@ -49,7 +52,7 @@ if TYPE_CHECKING:
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRecord, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
-from aiokafka.errors import TopicAlreadyExistsError
+from aiokafka.errors import IllegalStateError, KafkaError, TopicAlreadyExistsError
 
 logger = logging.getLogger(__name__)
 
@@ -212,13 +215,18 @@ class KafkaTable(Mapping[str, V]):
 
         self._live = _LiveStats()
         self._caught_up = asyncio.Event()
-        self._failed = asyncio.Event()  # wakes catch-up waiters on reader death
+        self._failed = asyncio.Event()  # wakes catch-up/barrier waiters on reader death
         self._data: dict[str, V] = {}
         self._task: asyncio.Task[None] | None = None
         self._consumer: AIOKafkaConsumer | None = None
         self._started = False
         self._timed_out = False
         self._failure: BaseException | None = None
+        # Pending barrier()s: (call-time end-offset targets, future resolved
+        # once positions reach them). Read and resolved only by the reader loop
+        # (positions must be read there — see barrier()); each barrier()
+        # self-prunes its own entry in a finally.
+        self._barriers: list[tuple[dict[TopicPartition, int], asyncio.Future[None]]] = []
 
     # -- read API (Mapping) ----------------------------------------------------
 
@@ -308,6 +316,74 @@ class KafkaTable(Mapping[str, V]):
             for fut in (caught, failed):
                 fut.cancel()
         return self._caught_up.is_set() and self._failure is None
+
+    async def barrier(self, timeout: float | None = None) -> bool:
+        """Wait until the table reflects everything published before this call.
+
+        Snapshots the topic's end offsets now (over the partitions assigned at
+        call time) and waits until the reader has consumed AND applied every
+        record below them. On ``True``, every record whose publish was
+        broker-acked before this call was invoked — on a call-time-assigned
+        partition — is visible in the mapping (or counted in ``stats`` as
+        keyless/decode-skipped). This is the on-demand read-your-own-writes
+        primitive: ``await writer.set(k, v); await table.barrier(); table[k]``
+        is then guaranteed.
+
+        ``timeout`` bounds the whole call (the end-offset snapshot plus the
+        wait); ``None`` waits indefinitely. Returns ``False`` on timeout,
+        reader death, ``stop()`` racing the wait, or a broker error/timeout
+        while snapshotting the end offsets — every "couldn't prove it" path is
+        a ``False``, never an exception. Raises ``RuntimeError`` only on
+        lifecycle misuse (table never started, or already stopped).
+
+        Runtime partition expansion is out of scope: the guarantee covers the
+        partitions assigned when ``barrier()`` was called.
+        """
+        self._require_started()
+        if self._consumer is None:
+            raise RuntimeError("table stopped — barrier() cannot prove freshness on a stopped table")
+        if self._failure is not None:
+            return False
+        consumer = self._consumer
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        tps = sorted(consumer.assignment(), key=lambda tp: tp.partition)
+        # Snapshot the call-time end offsets ourselves. end_offsets is a pure
+        # ListOffsets request/response: it touches no fetch buffers, positions,
+        # or subscription state, so it is safe to call from this coroutine
+        # while the reader task runs getmany on the same consumer. position(),
+        # which the reader's catch-up logic mutates state for and which can
+        # block ~request_timeout_ms, stays reader-loop-only. Bound the snapshot
+        # by the remaining budget (end_offsets is otherwise capped only by the
+        # consumer's request_timeout_ms, ~40s, unrelated to our timeout) and
+        # map a broker failure to False — an unanswerable ListOffsets is an
+        # environmental condition, same family as timeout/reader-death.
+        try:
+            snapshot_budget = None if deadline is None else max(0.0, deadline - loop.time())
+            targets: dict[TopicPartition, int] = await asyncio.wait_for(consumer.end_offsets(tps), timeout=snapshot_budget)
+        except (asyncio.TimeoutError, KafkaError):
+            logger.warning(
+                "barrier() could not snapshot end offsets for topic=%s (broker error/timeout); returning False",
+                self._topic,
+            )
+            return False
+        fut: asyncio.Future[None] = loop.create_future()
+        self._barriers.append((targets, fut))
+        failed = asyncio.ensure_future(self._failed.wait())
+        try:
+            wait_budget = None if deadline is None else max(0.0, deadline - loop.time())
+            await asyncio.wait({fut, failed}, timeout=wait_budget, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            failed.cancel()
+            if not fut.done():
+                fut.cancel()
+            # Self-prune: drop our own entry however the await exits (resolved,
+            # timed out, caller-cancelled, reader death). Self-pruning keeps the
+            # list clean even after a reader death, when the reader can no
+            # longer sweep. No await in this block — see the reader loop's
+            # invariant comment.
+            self._barriers = [(t, f) for t, f in self._barriers if f is not fut]
+        return fut.done() and not fut.cancelled() and self._failure is None
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -401,6 +477,14 @@ class KafkaTable(Mapping[str, V]):
                 # Logged by _on_reader_done; re-raising here would mask
                 # caller errors and skip consumer cleanup.
                 pass
+        # A cancelled reader task never resolves pending barriers, so wake them
+        # ourselves: a timeout=None barrier racing shutdown would otherwise hang
+        # forever. Each woken barrier() returns False and self-prunes; clearing
+        # here makes the list empty immediately regardless.
+        for _, fut in self._barriers:
+            if not fut.done():
+                fut.cancel()
+        self._barriers.clear()
         consumer, self._consumer = self._consumer, None
         if consumer is not None:
             try:
@@ -472,6 +556,44 @@ class KafkaTable(Mapping[str, V]):
                     self._live.catch_up_seconds = time.perf_counter() - started
                     self._live.replayed_at_catch_up = self._live.records_applied + self._live.tombstones_applied
                     self._caught_up.set()
+            if self._barriers:
+                # Read positions only for partitions that some pending barrier
+                # targets, in the same coroutine that runs _apply and after it,
+                # so "positions reached => records applied" holds by
+                # construction. Assignment is grow-only under group_id=None
+                # EXCEPT for transient shrinks: a metadata blip can momentarily
+                # empty the assignment, making position() raise
+                # IllegalStateError. Catch it and omit that tp (its barrier
+                # defers via the .get(tp, -1) default below) rather than letting
+                # a blip aiokafka self-heals from kill the reader for good.
+                needed = {tp for targets, _ in self._barriers for tp in targets}
+                barrier_positions: dict[TopicPartition, int] = {}
+                for tp in needed:
+                    try:
+                        barrier_positions[tp] = await consumer.position(tp)
+                    except IllegalStateError:
+                        pass  # transiently unassigned: defer barriers needing tp
+                # INVARIANT: the authoritative read is the `for` loop below, and
+                # there is no await between it and the rebind, so the
+                # read-modify-write of self._barriers is atomic w.r.t. the event
+                # loop. The awaits above are the only yield points: a barrier
+                # appended (or self-pruned) during them is still seen by the for
+                # loop, and if its target is absent from barrier_positions it
+                # defers via the .get(tp, -1) default below.
+                still_pending: list[tuple[dict[TopicPartition, int], asyncio.Future[None]]] = []
+                for targets, fut in self._barriers:
+                    if fut.cancelled():
+                        continue  # timed-out / caller-cancelled: drop, never re-add
+                    # .get(tp, -1): a target tp can be absent from
+                    # barrier_positions — a barrier appended during the awaits
+                    # above, or a tp whose position() raised and was skipped; -1
+                    # fails the >= check and defers, never resolving on missing data.
+                    if all(barrier_positions.get(tp, -1) >= off for tp, off in targets.items()):
+                        if not fut.done():
+                            fut.set_result(None)
+                    else:
+                        still_pending.append((targets, fut))
+                self._barriers = still_pending
 
 
 class KafkaTableWriter(Generic[V]):

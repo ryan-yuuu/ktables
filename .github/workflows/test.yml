@@ -38,3 +38,29 @@ jobs:
           exit 1
       - name: Run full suite against the broker
         run: uv run --python 3.12 pytest -rs
+
+  floor:
+    # Verify the declared runtime floor actually works: pin aiokafka to the
+    # lowest version pyproject allows (keep this in sync with the >= in
+    # pyproject.toml) while test tooling resolves current, and run the full
+    # broker-backed suite on the NEWEST Python — the corner most likely to lack
+    # wheels for an old dependency. This closes the "verified-vs-shipped" gap.
+    runs-on: ubuntu-latest
+    services:
+      kafka:
+        image: apache/kafka:3.9.0
+        ports:
+          - 9092:9092
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - name: Wait for Kafka
+        run: |
+          for i in $(seq 1 30); do
+            (echo > /dev/tcp/localhost/9092) 2>/dev/null && exit 0
+            sleep 2
+          done
+          echo "Kafka did not become reachable" >&2
+          exit 1
+      - name: Run full suite against the aiokafka floor
+        run: uv run --python 3.13 --with 'aiokafka==0.13.0' pytest -rs
