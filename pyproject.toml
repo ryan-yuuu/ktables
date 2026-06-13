@@ -8,7 +8,7 @@ requires-python = ">=3.10"
 dependencies = ["aiokafka>=0.13"]
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "pydantic>=2", "typing-extensions>=4.0"]
+dev = ["pytest>=8", "pytest-asyncio>=0.24", "pytest-cov>=7.1.0", "pydantic>=2", "typing-extensions>=4.0"]
 
 [build-system]
 requires = ["hatchling"]
@@ -20,3 +20,15 @@ packages = ["ktables"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+
+[tool.coverage.run]
+# ``relative_files`` is mandatory for python-coverage-comment-action.
+# coverage.py records absolute file paths by default, but the action reads the
+# .coverage file inside its own Docker container, whose workspace path differs
+# from the runner's. Repo-relative paths are the only ones that resolve in both.
+relative_files = true
+source = ["ktables"]
+branch = true
+
+[tool.coverage.report]
+omit = ["*/__init__.py"]
