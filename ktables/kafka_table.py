@@ -31,8 +31,9 @@ Consistency contract (the four guarantees):
    primitive (it proves visibility of every record acked before the call, on
    the partitions assigned at call time).
 
-See README.md for usage. Integration tests need a Kafka broker on
-localhost:9092: ``pytest tests``.
+See README.md for usage. Integration tests spin up Redpanda automatically via
+testcontainers (Docker required): ``pytest`` — or ``pytest -m "not integration"``
+for the broker-free unit suite.
 """
 
 from __future__ import annotations
