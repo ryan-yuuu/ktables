@@ -212,7 +212,7 @@ repo is developed with [uv](https://docs.astral.sh/uv/); please run the test
 suite before submitting:
 
 ```sh
-$ uv run pytest tests
+uv run pytest tests
 ```
 
 Unit tests always run; integration tests need a Kafka broker on
