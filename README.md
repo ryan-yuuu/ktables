@@ -2,10 +2,10 @@
 
 [Full report](https://htmlpreview.github.io/?https://github.com/ryan-yuuu/ktables/blob/python-coverage-comment-action-data/htmlcov/index.html)
 
-| Name                    |    Stmts |     Miss |   Branch |   BrPart |   Cover |   Missing |
-|------------------------ | -------: | -------: | -------: | -------: | ------: | --------: |
-| ktables/kafka\_table.py |      336 |      109 |       90 |       13 |     66% |118-119, 135, 139, 247, 259, 289, 293, 311-318, 345-386, 402-446, 458-460, 471-479, 496-497, 500, 517-528, 542-543, 555-\>559, 574-575, 593-595, 650, 657-661, 666, 669-670, 673, 678, 686, 690 |
-| **TOTAL**               |  **336** |  **109** |   **90** |   **13** | **66%** |           |
+| Name                    |    Stmts |     Miss |   Branch |   BrPart |    Cover |   Missing |
+|------------------------ | -------: | -------: | -------: | -------: | -------: | --------: |
+| ktables/kafka\_table.py |      336 |        0 |       90 |        0 |     100% |           |
+| **TOTAL**               |  **336** |    **0** |   **90** |    **0** | **100%** |           |
 
 
 ## Setup coverage badge
