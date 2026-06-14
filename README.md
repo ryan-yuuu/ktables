@@ -215,9 +215,9 @@ suite before submitting:
 uv run pytest tests
 ```
 
-Unit tests always run; integration tests need a Kafka broker on
-`localhost:9092` and skip otherwise
-(`docker run -d -p 9092:9092 apache/kafka:3.9.0`).
+The integration tests spin up a Redpanda broker automatically via
+[testcontainers](https://testcontainers.com/) (Docker required). Run only the
+broker-free unit suite with `uv run pytest -m "not integration"`.
 
 <br>
 

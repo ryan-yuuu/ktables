@@ -8,7 +8,14 @@ requires-python = ">=3.10"
 dependencies = ["aiokafka>=0.13"]
 
 [dependency-groups]
-dev = ["pytest>=8", "pytest-asyncio>=0.24", "pytest-cov>=7.1.0", "pydantic>=2", "typing-extensions>=4.0"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=7.1.0",
+    "pydantic>=2",
+    "typing-extensions>=4.0",
+    "testcontainers[kafka]>=4",
+]
 
 [build-system]
 requires = ["hatchling"]
@@ -20,6 +27,9 @@ packages = ["ktables"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "integration: needs a Redpanda broker (auto-started via testcontainers; Docker required). Auto-applied to any test using the bootstrap/topic fixtures.",
+]
 
 [tool.coverage.run]
 # ``relative_files`` is mandatory for python-coverage-comment-action.

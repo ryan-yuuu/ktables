@@ -22,65 +22,19 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
-      - name: Run unit tests (integration auto-skips without a broker)
-        run: uv run --python ${{ matrix.python-version }} pytest -rs
-
-  integration:
-    runs-on: ubuntu-latest
-    services:
-      kafka:
-        image: apache/kafka:3.9.0
-        ports:
-          - 9092:9092
-    steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v7
-      - name: Wait for Kafka
-        run: |
-          for i in $(seq 1 30); do
-            (echo > /dev/tcp/localhost/9092) 2>/dev/null && exit 0
-            sleep 2
-          done
-          echo "Kafka did not become reachable" >&2
-          exit 1
-      - name: Run full suite against the broker
-        run: uv run --python 3.12 pytest -rs
-
-  floor:
-    # Verify the declared runtime floor actually works: pin aiokafka to the
-    # lowest version pyproject allows (keep this in sync with the >= in
-    # pyproject.toml) while test tooling resolves current, and run the full
-    # broker-backed suite on the NEWEST Python — the corner most likely to lack
-    # wheels for an old dependency. This closes the "verified-vs-shipped" gap.
-    runs-on: ubuntu-latest
-    services:
-      kafka:
-        image: apache/kafka:3.9.0
-        ports:
-          - 9092:9092
-    steps:
-      - uses: actions/checkout@v6
-      - uses: astral-sh/setup-uv@v7
-      - name: Wait for Kafka
-        run: |
-          for i in $(seq 1 30); do
-            (echo > /dev/tcp/localhost/9092) 2>/dev/null && exit 0
-            sleep 2
-          done
-          echo "Kafka did not become reachable" >&2
-          exit 1
-      - name: Run full suite against the aiokafka floor
-        run: uv run --python 3.13 --with 'aiokafka==0.13.0' pytest -rs
+      - name: Run unit suite (broker tests deselected; no Docker)
+        run: uv run --python ${{ matrix.python-version }} pytest -m "not integration"
 
   coverage:
-    # Reports the test coverage badge/data, single-version on purpose: the
-    # matrix `unit` job is the test gate, while exactly one job owns coverage so
-    # the parallel legs don't race to write the data branch. Runs unit-only
-    # (integration auto-skips without a broker) for a deterministic number with
-    # no external service. python-coverage-comment-action commits the badge +
-    # coverage data to its own `python-coverage-comment-action-data` branch on
-    # pushes to main and posts the coverage comment on same-repo PRs; the
-    # companion `coverage.yml` posts it for fork / Dependabot PRs.
+    # Owns the coverage badge AND the broker-backed integration run. The full
+    # suite runs against a real Redpanda broker that testcontainers spins up, so
+    # the integration paths contribute to coverage — not just the mocked unit
+    # tests. Single-version on purpose: exactly one job writes the data branch,
+    # so the parallel legs don't race. testcontainers needs Docker, which the
+    # ubuntu-latest runner provides out of the box. python-coverage-comment-action
+    # commits the badge + coverage data to its own data branch on pushes to main
+    # and posts the coverage comment on same-repo PRs; the companion
+    # coverage.yml posts it for fork / Dependabot PRs.
     runs-on: ubuntu-latest
     # Elevated for THIS job only (the workflow default is `contents: read`).
     permissions:
@@ -89,7 +43,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: astral-sh/setup-uv@v7
-      - name: Run unit tests with coverage
+      - name: Run full suite with coverage (Redpanda via testcontainers)
         # Coverage config lives in pyproject.toml ([tool.coverage.run]); this
         # writes the .coverage file the action consumes below.
         run: uv run --python 3.12 pytest -q --cov --cov-report=term-missing
@@ -107,3 +61,17 @@ jobs:
         with:
           name: python-coverage-comment-action
           path: python-coverage-comment-action.txt
+
+  floor:
+    # Verify the declared runtime floor actually works: pin aiokafka to the
+    # lowest version pyproject allows (keep this in sync with the >= in
+    # pyproject.toml) while test tooling resolves current, and run the full
+    # broker-backed suite on the NEWEST Python — the corner most likely to lack
+    # wheels for an old dependency. This closes the "verified-vs-shipped" gap.
+    # testcontainers spins up Redpanda (Docker is provided by the runner).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v7
+      - name: Run full suite against the aiokafka floor
+        run: uv run --python 3.13 --with 'aiokafka==0.13.0' pytest

@@ -1,10 +1,11 @@
 """Tests for ktables — pure unit tests plus broker-backed integration tests.
 
-The integration tests (everything using the ``topic`` fixture) need a Kafka
-broker on localhost:9092 and are skipped, loudly, when none is reachable:
+The integration tests (everything using the ``bootstrap``/``topic`` fixtures)
+run against a real Redpanda broker that testcontainers spins up automatically
+(Docker required). They are auto-marked ``integration`` — see tests/conftest.py:
 
-    docker run -d --name ktables-test-kafka -p 9092:9092 apache/kafka:3.9.0
-    pytest tests
+    uv run pytest                       # full suite (needs Docker)
+    uv run pytest -m "not integration"  # unit suite only (no Docker)
 """
 
 from __future__ import annotations
@@ -25,6 +26,10 @@ from pydantic import AwareDatetime, BaseModel
 from ktables import KafkaTable, KafkaTableWriter, ViewStats
 from ktables.kafka_table import ensure_topic
 
+# Placeholder address for pure-unit tests that construct a table/writer but
+# never start() it (so they never connect). Integration tests get the real
+# broker address from the ``bootstrap`` fixture / the table_factory/writer_factory
+# fixtures instead.
 BOOTSTRAP = "localhost:9092"
 
 
@@ -47,6 +52,8 @@ def make_record(service_id: str, revision: int) -> ServiceRecord:
     )
 
 
+# Unit-only builders (never connect — see BOOTSTRAP above). Integration tests
+# use the table_factory/writer_factory fixtures, which bind the live broker.
 def make_table(topic: str) -> KafkaTable[ServiceRecord]:
     return KafkaTable.json(bootstrap_servers=BOOTSTRAP, topic=topic, model=ServiceRecord)
 
@@ -150,31 +157,35 @@ class TestBarrierLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# Integration tests (broker required; skipped when unreachable)
+# Integration tests (broker required; Redpanda auto-started via testcontainers)
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="session")
-def broker_available() -> bool:
-    async def probe() -> bool:
-        admin = AIOKafkaAdminClient(bootstrap_servers=BOOTSTRAP)
-        try:
-            await admin.start()
-            await admin.close()
-            return True
-        except Exception:
-            return False
+@pytest.fixture
+def table_factory(bootstrap: str):
+    """Build a ServiceRecord KafkaTable bound to the session Redpanda broker."""
 
-    return asyncio.run(probe())
+    def _make(topic: str, **kwargs: object) -> KafkaTable[ServiceRecord]:
+        return KafkaTable.json(bootstrap_servers=bootstrap, topic=topic, model=ServiceRecord, **kwargs)
+
+    return _make
 
 
 @pytest.fixture
-async def topic(broker_available: bool):
-    if not broker_available:
-        pytest.skip(f"no Kafka broker reachable at {BOOTSTRAP}")
+def writer_factory(bootstrap: str):
+    """Build a ServiceRecord KafkaTableWriter bound to the session Redpanda broker."""
+
+    def _make(topic: str, **kwargs: object) -> KafkaTableWriter[ServiceRecord]:
+        return KafkaTableWriter.json(bootstrap_servers=bootstrap, topic=topic, model=ServiceRecord, **kwargs)
+
+    return _make
+
+
+@pytest.fixture
+async def topic(bootstrap: str):
     name = f"ktables.test.{uuid.uuid4().hex[:8]}"
     yield name
-    admin = AIOKafkaAdminClient(bootstrap_servers=BOOTSTRAP)
+    admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap)
     await admin.start()
     try:
         await admin.delete_topics([name])
@@ -182,31 +193,31 @@ async def topic(broker_available: bool):
         await admin.close()
 
 
-async def test_reader_first_creates_topic_and_absorbs_writes_as_live_updates(topic: str) -> None:
+async def test_reader_first_creates_topic_and_absorbs_writes_as_live_updates(topic: str, table_factory, writer_factory) -> None:
     # No bring-up order: the reader ensures the topic, gates instantly on the
     # empty log, then sees the late writer's records without a restart.
-    async with make_table(topic) as table:
+    async with table_factory(topic) as table:
         assert table.status == "caught_up"
         assert len(table) == 0
-        async with make_writer(topic) as writer:
+        async with writer_factory(topic) as writer:
             await writer.set("alpha", make_record("alpha", 1))
             assert await eventually(lambda: "alpha" in table)
 
 
-async def test_double_start_raises(topic: str) -> None:
-    async with make_table(topic) as table:
+async def test_double_start_raises(topic: str, table_factory, writer_factory) -> None:
+    async with table_factory(topic) as table:
         with pytest.raises(RuntimeError, match="already started"):
             await table.start()
 
 
-async def test_cold_start_replays_lww_over_uncompacted_history(topic: str) -> None:
+async def test_cold_start_replays_lww_over_uncompacted_history(topic: str, table_factory, writer_factory) -> None:
     services, revs = ["alpha", "beta", "gamma"], 40
-    async with make_writer(topic) as writer:
+    async with writer_factory(topic) as writer:
         for rev in range(1, revs + 1):
             for svc in services:
                 await writer.set(svc, make_record(svc, rev))
 
-        async with make_table(topic) as table:
+        async with table_factory(topic) as table:
             # Catch-up gate: complete as of start-time end offsets. The topic
             # is too young for compaction, so this proves LWW over full history.
             assert table.status == "caught_up"
@@ -229,16 +240,16 @@ async def test_cold_start_replays_lww_over_uncompacted_history(topic: str) -> No
             assert table.status == "caught_up"
 
 
-async def test_restart_rehydrates_identically(topic: str) -> None:
-    async with make_writer(topic) as writer:
+async def test_restart_rehydrates_identically(topic: str, table_factory, writer_factory) -> None:
+    async with writer_factory(topic) as writer:
         await writer.set("alpha", make_record("alpha", 2))
         await writer.set("beta", make_record("beta", 1))
         await writer.delete("beta")
 
-    async with make_table(topic) as first:
+    async with table_factory(topic) as first:
         snapshot_one = {k: v.revision for k, v in first.snapshot().items()}
 
-    async with make_table(topic) as second:
+    async with table_factory(topic) as second:
         snapshot_two = {k: v.revision for k, v in second.snapshot().items()}
 
     assert snapshot_one == snapshot_two == {"alpha": 2}
@@ -260,11 +271,11 @@ def _unreachable_end_offsets(real):
     return inflated
 
 
-async def test_barrier_makes_prior_writes_immediately_visible(topic: str) -> None:
+async def test_barrier_makes_prior_writes_immediately_visible(topic: str, table_factory, writer_factory) -> None:
     # The core RYOW guarantee: after barrier() returns True, every record acked
     # before the call is visible *immediately* — no eventually(). This is the
     # test that would fail under a racy position-polling design.
-    async with make_table(topic) as table, make_writer(topic) as writer:
+    async with table_factory(topic) as table, writer_factory(topic) as writer:
         keys = [f"svc{i}" for i in range(10)]
         for k in keys:
             await writer.set(k, make_record(k, 1))
@@ -274,8 +285,8 @@ async def test_barrier_makes_prior_writes_immediately_visible(topic: str) -> Non
         assert table._barriers == []
 
 
-async def test_barrier_makes_tombstones_immediately_visible(topic: str) -> None:
-    async with make_table(topic) as table, make_writer(topic) as writer:
+async def test_barrier_makes_tombstones_immediately_visible(topic: str, table_factory, writer_factory) -> None:
+    async with table_factory(topic) as table, writer_factory(topic) as writer:
         await writer.set("k", make_record("k", 1))
         assert await table.barrier() is True
         assert "k" in table
@@ -284,14 +295,14 @@ async def test_barrier_makes_tombstones_immediately_visible(topic: str) -> None:
         assert "k" not in table
 
 
-async def test_barrier_on_idle_caught_up_table_returns_true(topic: str) -> None:
-    async with make_table(topic) as table:
+async def test_barrier_on_idle_caught_up_table_returns_true(topic: str, table_factory, writer_factory) -> None:
+    async with table_factory(topic) as table:
         assert table.status == "caught_up"
         assert await table.barrier(timeout=5) is True
 
 
-async def test_concurrent_barriers_all_resolve_and_see_their_writes(topic: str) -> None:
-    async with make_table(topic) as table, make_writer(topic) as writer:
+async def test_concurrent_barriers_all_resolve_and_see_their_writes(topic: str, table_factory, writer_factory) -> None:
+    async with table_factory(topic) as table, writer_factory(topic) as writer:
         keys = [f"k{i}" for i in range(10)]
         for k in keys:
             await writer.set(k, make_record(k, 1))
@@ -302,11 +313,11 @@ async def test_concurrent_barriers_all_resolve_and_see_their_writes(topic: str) 
         assert table._barriers == []
 
 
-async def test_barrier_targets_call_time_offsets_not_later_writes(topic: str) -> None:
+async def test_barrier_targets_call_time_offsets_not_later_writes(topic: str, table_factory, writer_factory) -> None:
     # barrier() snapshots the end offsets at call time, so it returns True even
     # while new writes keep arriving — it does not wait for post-call records.
     # If it waited for "all writes ever", the churn would make it time out.
-    async with make_table(topic) as table, make_writer(topic) as writer:
+    async with table_factory(topic) as table, writer_factory(topic) as writer:
         await writer.set("pre", make_record("pre", 1))
         stop = asyncio.Event()
 
@@ -325,12 +336,12 @@ async def test_barrier_targets_call_time_offsets_not_later_writes(topic: str) ->
             await churn_task
 
 
-async def test_barrier_resolves_across_multiple_poll_iterations(topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_barrier_resolves_across_multiple_poll_iterations(topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
     # Throttle the reader to one record per poll so the barrier's target offset
     # is reached only after many reader-loop iterations — exercising the
     # across-iterations sweep, not single-shot resolution.
-    table = KafkaTable.json(bootstrap_servers=BOOTSTRAP, topic=topic, model=ServiceRecord, poll_timeout_ms=20)
-    async with table, make_writer(topic) as writer:
+    table = table_factory(topic, poll_timeout_ms=20)
+    async with table, writer_factory(topic) as writer:
         real_getmany = table._consumer.getmany  # type: ignore[union-attr]
 
         async def one_at_a_time(*args, **kwargs):
@@ -347,16 +358,16 @@ async def test_barrier_resolves_across_multiple_poll_iterations(topic: str, monk
         assert table._barriers == []
 
 
-async def test_barrier_times_out_to_false_without_leaking(topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    async with make_table(topic) as table:
+async def test_barrier_times_out_to_false_without_leaking(topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
+    async with table_factory(topic) as table:
         monkeypatch.setattr(table._consumer, "end_offsets", _unreachable_end_offsets(table._consumer.end_offsets))
         assert await table.barrier(timeout=0.5) is False
         assert table.status == "caught_up"  # table itself stays healthy
         assert table._barriers == []  # no leak: the barrier self-pruned
 
 
-async def test_barrier_returns_false_on_snapshot_error(topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    async with make_table(topic) as table:
+async def test_barrier_returns_false_on_snapshot_error(topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
+    async with table_factory(topic) as table:
         # (a) broker error while snapshotting → False, never raised, never registered.
         async def boom(partitions, *args, **kwargs):
             raise KafkaError("induced ListOffsets failure")
@@ -375,8 +386,8 @@ async def test_barrier_returns_false_on_snapshot_error(topic: str, monkeypatch: 
         assert table._barriers == []
 
 
-async def test_barrier_returns_false_promptly_on_reader_death(topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    async with make_table(topic) as table:
+async def test_barrier_returns_false_promptly_on_reader_death(topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
+    async with table_factory(topic) as table:
         # Hold the barrier in its wait phase…
         monkeypatch.setattr(table._consumer, "end_offsets", _unreachable_end_offsets(table._consumer.end_offsets))
         bar = asyncio.create_task(table.barrier(timeout=30))
@@ -393,9 +404,9 @@ async def test_barrier_returns_false_promptly_on_reader_death(topic: str, monkey
         assert table._barriers == []
 
 
-async def test_barrier_returns_false_when_stop_races_the_wait(topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_barrier_returns_false_when_stop_races_the_wait(topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
     # Regression guard: a timeout=None barrier racing shutdown must not hang.
-    table = make_table(topic)
+    table = table_factory(topic)
     await table.start()
     try:
         monkeypatch.setattr(table._consumer, "end_offsets", _unreachable_end_offsets(table._consumer.end_offsets))
@@ -408,11 +419,11 @@ async def test_barrier_returns_false_when_stop_races_the_wait(topic: str, monkey
             await table.stop()
 
 
-async def test_barrier_returns_false_immediately_when_reader_already_dead(topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_barrier_returns_false_immediately_when_reader_already_dead(topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
     # The reader-already-dead fast-path (distinct from death *during* the wait):
     # barrier() must short-circuit to False at the _failure check, before it
     # snapshots end offsets or registers — so nothing is ever queued.
-    async with make_table(topic) as table:
+    async with table_factory(topic) as table:
         async def boom(*args, **kwargs):
             raise RuntimeError("induced reader death")
 
@@ -422,13 +433,13 @@ async def test_barrier_returns_false_immediately_when_reader_already_dead(topic:
         assert table._barriers == []  # never registered — short-circuited
 
 
-async def test_barrier_survives_transient_position_unavailability(topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_barrier_survives_transient_position_unavailability(topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
     # A metadata blip can momentarily empty the assignment under group_id=None,
     # making consumer.position() raise IllegalStateError. The reader must
     # tolerate it (not die) and the barrier must still resolve once positions
     # are readable again. Without the catch, the first raise kills the reader
     # and the barrier returns False.
-    async with make_table(topic) as table, make_writer(topic) as writer:
+    async with table_factory(topic) as table, writer_factory(topic) as writer:
         await writer.set("k", make_record("k", 1))
         real_position = table._consumer.position
         calls = {"n": 0}
@@ -445,14 +456,14 @@ async def test_barrier_survives_transient_position_unavailability(topic: str, mo
         assert table._barriers == []
 
 
-async def test_barrier_accounts_for_decode_skipped_records(topic: str) -> None:
+async def test_barrier_accounts_for_decode_skipped_records(topic: str, table_factory, writer_factory) -> None:
     # The docstring guarantees that on True, every acked record is visible "or
     # counted in stats as decode-skipped". A poison value sits below the
     # barrier's target: the reader advances past it (counting the skip), so the
     # barrier still resolves and the good record after it shows immediately.
     # (Keyless records aren't covered here: a compacted topic rejects null-key
     # records broker-side, so that path can't arise on a table-shaped topic.)
-    async with make_table(topic) as table, make_writer(topic) as writer:
+    async with table_factory(topic) as table, writer_factory(topic) as writer:
         await writer._require_producer().send_and_wait(topic, value=b"{not json", key=b"poison")
         await writer.set("good", make_record("good", 1))
         assert await table.barrier() is True
@@ -730,32 +741,32 @@ class TestReaderLoopUnit:
 
 
 class TestStartEdgePaths:
-    async def test_start_skips_ensure_topic_when_disabled(self, topic: str) -> None:
-        await ensure_topic(BOOTSTRAP, topic)  # pre-create: the table won't ensure it
-        table = KafkaTable.json(bootstrap_servers=BOOTSTRAP, topic=topic, model=ServiceRecord, ensure_topic=False)
+    async def test_start_skips_ensure_topic_when_disabled(self, bootstrap, topic: str, table_factory, writer_factory) -> None:
+        await ensure_topic(bootstrap, topic)  # pre-create: the table won't ensure it
+        table = table_factory(topic, ensure_topic=False)
         async with table:
             assert table.status == "caught_up"
 
-    async def test_start_raises_and_cleans_up_when_no_partitions(self, topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_start_raises_and_cleans_up_when_no_partitions(self, topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
         # An empty assignment after consumer.start() means the topic is missing
         # (or ensure was masked): start() must raise and tear the consumer down.
         monkeypatch.setattr(AIOKafkaConsumer, "assignment", lambda self: set())
-        table = make_table(topic)
+        table = table_factory(topic)
         with pytest.raises(RuntimeError, match="no partitions assigned"):
             await table.start()
         assert table._consumer is None  # except-BaseException cleanup ran
 
-    async def test_start_raises_when_reader_dies_during_catchup(self, topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_start_raises_when_reader_dies_during_catchup(self, topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
         async def boom(self, *args, **kwargs):
             raise RuntimeError("induced reader death")
 
         monkeypatch.setattr(AIOKafkaConsumer, "getmany", boom)
-        table = make_table(topic)
+        table = table_factory(topic)
         with pytest.raises(RuntimeError, match="died during catch-up"):
             await table.start()
         assert table.status == "failed"
 
-    async def test_start_degrades_when_catchup_times_out(self, topic: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_start_degrades_when_catchup_times_out(self, topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
         # Inflate the start-time end offsets so the gate is never reachable; with
         # a tight catchup_timeout, start() returns DEGRADED rather than crashing.
         real = AIOKafkaConsumer.end_offsets
@@ -765,7 +776,7 @@ class TestStartEdgePaths:
             return {tp: off + 10_000 for tp, off in offsets.items()}
 
         monkeypatch.setattr(AIOKafkaConsumer, "end_offsets", inflated)
-        table = KafkaTable.json(bootstrap_servers=BOOTSTRAP, topic=topic, model=ServiceRecord, catchup_timeout=0.5)
+        table = table_factory(topic, catchup_timeout=0.5)
         async with table:
             assert table.status == "degraded"
 
@@ -794,8 +805,8 @@ class TestWriterUnit:
 
 
 class TestWriterEnsureTopicDisabled:
-    async def test_start_skips_ensure_topic_when_disabled(self, topic: str) -> None:
-        await ensure_topic(BOOTSTRAP, topic)  # pre-create: the writer won't ensure it
-        writer = KafkaTableWriter.json(bootstrap_servers=BOOTSTRAP, topic=topic, model=ServiceRecord, ensure_topic=False)
+    async def test_start_skips_ensure_topic_when_disabled(self, bootstrap, topic: str, table_factory, writer_factory) -> None:
+        await ensure_topic(bootstrap, topic)  # pre-create: the writer won't ensure it
+        writer = writer_factory(topic, ensure_topic=False)
         async with writer:
             await writer.set("k", make_record("k", 1))
