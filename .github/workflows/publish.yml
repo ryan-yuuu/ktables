@@ -2,7 +2,8 @@ name: Publish to PyPI
 
 # Manual fallback / re-publish path. Automatic publishing on each release is
 # chained inside release-please.yml (GITHUB_TOKEN-created releases cannot
-# trigger `on: release` here). Run with the tag to publish, e.g. v0.1.0.
+# trigger `on: release` here). Run with the tag to publish, e.g. v0.1.0. The
+# build/publish steps are shared with release-please via .github/actions/publish.
 
 on:
   workflow_dispatch:
@@ -10,6 +11,9 @@ on:
       tag:
         description: "Release tag to publish (e.g. v0.1.0)"
         required: true
+
+# Least-privilege default; the pypi job opts into the one token scope it needs.
+permissions: {}
 
 jobs:
   pypi:
@@ -20,11 +24,7 @@ jobs:
     permissions:
       id-token: write  # OIDC trusted publishing
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6  # make the local composite action available
+      - uses: ./.github/actions/publish
         with:
-          ref: ${{ inputs.tag }}
-      - uses: astral-sh/setup-uv@v7
-      - name: Build sdist and wheel
-        run: uv build
-      - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+          tag: ${{ inputs.tag }}

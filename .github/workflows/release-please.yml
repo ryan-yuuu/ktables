@@ -21,7 +21,8 @@ jobs:
           release-type: python
 
   # Chained here because releases created with GITHUB_TOKEN do not fire
-  # `on: release` in other workflows (GitHub recursion guard).
+  # `on: release` in other workflows (GitHub recursion guard). Build/publish
+  # steps are shared with publish.yml via .github/actions/publish.
   publish:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
@@ -32,11 +33,7 @@ jobs:
     permissions:
       id-token: write  # OIDC trusted publishing
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6  # make the local composite action available
+      - uses: ./.github/actions/publish
         with:
-          ref: ${{ needs.release-please.outputs.tag_name }}
-      - uses: astral-sh/setup-uv@v7
-      - name: Build sdist and wheel
-        run: uv build
-      - name: Publish
-        uses: pypa/gh-action-pypi-publish@release/v1
+          tag: ${{ needs.release-please.outputs.tag_name }}
