@@ -21,8 +21,9 @@ jobs:
           release-type: python
 
   # Chained here because releases created with GITHUB_TOKEN do not fire
-  # `on: release` in other workflows (GitHub recursion guard). Build/publish
-  # steps are shared with publish.yml via .github/actions/publish.
+  # `on: release` in other workflows (GitHub recursion guard). Steps are inline
+  # (and duplicated in publish.yml) because pypa/gh-action-pypi-publish is a
+  # Docker action and cannot be nested inside a local composite action.
   publish:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
@@ -33,7 +34,11 @@ jobs:
     permissions:
       id-token: write  # OIDC trusted publishing
     steps:
-      - uses: actions/checkout@v6  # make the local composite action available
-      - uses: ./.github/actions/publish
+      - uses: actions/checkout@v6
         with:
-          tag: ${{ needs.release-please.outputs.tag_name }}
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - uses: astral-sh/setup-uv@v7
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1

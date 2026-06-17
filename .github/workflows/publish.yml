@@ -2,8 +2,12 @@ name: Publish to PyPI
 
 # Manual fallback / re-publish path. Automatic publishing on each release is
 # chained inside release-please.yml (GITHUB_TOKEN-created releases cannot
-# trigger `on: release` here). Run with the tag to publish, e.g. v0.1.0. The
-# build/publish steps are shared with release-please via .github/actions/publish.
+# trigger `on: release` here). Run with the tag to publish, e.g. v0.1.0.
+#
+# These steps are deliberately inline (and duplicated in release-please.yml):
+# pypa/gh-action-pypi-publish is a Docker action and cannot be nested inside a
+# local composite action — doing so makes it resolve its image as
+# ghcr.io/<this-repo>:<ref> and fail with "denied".
 
 on:
   workflow_dispatch:
@@ -24,7 +28,11 @@ jobs:
     permissions:
       id-token: write  # OIDC trusted publishing
     steps:
-      - uses: actions/checkout@v6  # make the local composite action available
-      - uses: ./.github/actions/publish
+      - uses: actions/checkout@v6
         with:
-          tag: ${{ inputs.tag }}
+          ref: ${{ inputs.tag }}
+      - uses: astral-sh/setup-uv@v7
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@release/v1
