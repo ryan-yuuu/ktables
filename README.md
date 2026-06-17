@@ -1,7 +1,7 @@
 # ktables
 
 [![PyPI](https://img.shields.io/pypi/v/ktables)](https://pypi.org/project/ktables/)
-[![Tests](https://github.com/ryan-yuuu/ktables/actions/workflows/test.yml/badge.svg)](https://github.com/ryan-yuuu/ktables/actions/workflows/test.yml)
+[![CI](https://github.com/ryan-yuuu/ktables/actions/workflows/ci.yml/badge.svg)](https://github.com/ryan-yuuu/ktables/actions/workflows/ci.yml)
 [![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/ryan-yuuu/ktables/python-coverage-comment-action-data/endpoint.json)](https://github.com/ryan-yuuu/ktables/tree/python-coverage-comment-action-data)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
