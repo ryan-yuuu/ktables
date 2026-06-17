@@ -97,6 +97,12 @@ class TestConstruction:
         with pytest.raises(TypeError):
             KafkaTableWriter(bootstrap_servers="b", topic="t", value_encoder="nope")  # type: ignore[arg-type]
 
+    def test_rejects_non_callable_hooks(self) -> None:
+        with pytest.raises(TypeError, match="callable"):
+            KafkaTable(bootstrap_servers="b", topic="t", value_decoder=bytes, on_set="nope")  # type: ignore[arg-type]
+        with pytest.raises(TypeError, match="callable"):
+            KafkaTable(bootstrap_servers="b", topic="t", value_decoder=bytes, on_delete="nope")  # type: ignore[arg-type]
+
 
 class TestUnstartedGuards:
     def test_reads_raise_before_start(self) -> None:
@@ -110,6 +116,9 @@ class TestUnstartedGuards:
         writer = make_writer("unit.never.started")
         with pytest.raises(RuntimeError, match="not started"):
             writer._require_producer()
+
+    def test_started_is_false_before_start(self) -> None:
+        assert make_table("unit.never.started").started is False
 
 
 class TestResourceHandleSemantics:
@@ -657,6 +666,86 @@ class TestApplyUnit:
         assert len(table._data) == 0
 
 
+class TestApplyHooks:
+    """on_set/on_delete fire on _apply's two branches, never on a rejected
+    record; _apply does not wrap a raising hook (fail-loud). All broker-free."""
+
+    @staticmethod
+    def _bytes_table(**kw: object) -> KafkaTable[bytes]:
+        return KafkaTable(bootstrap_servers=BOOTSTRAP, topic="unit.hooks", value_decoder=bytes, **kw)
+
+    def test_on_set_fires_with_key_and_decoded_value(self) -> None:
+        sets: list[tuple[str, bytes]] = []
+        table = self._bytes_table(on_set=lambda k, v: sets.append((k, v)))
+        table._apply(_fake_record(key=b"billing", value=b"payload"))  # type: ignore[arg-type]
+        assert sets == [("billing", b"payload")]
+        assert table._data["billing"] == b"payload"
+
+    def test_on_delete_fires_with_key_on_tombstone(self) -> None:
+        sets: list[tuple[str, bytes]] = []
+        deletes: list[str] = []
+        table = self._bytes_table(on_set=lambda k, v: sets.append((k, v)), on_delete=deletes.append)
+        table._apply(_fake_record(key=b"billing", value=None))  # type: ignore[arg-type]
+        assert deletes == ["billing"]
+        assert sets == []
+
+    def test_on_set_fires_with_none_value_not_on_delete(self) -> None:
+        # Option-B guard: a value_decoder returning None for a NON-null record is
+        # an upsert-to-None, never a tombstone — on_set fires, on_delete does not.
+        sets: list[tuple[str, object]] = []
+        deletes: list[str] = []
+        table = KafkaTable(
+            bootstrap_servers=BOOTSTRAP, topic="unit.hooks.none", value_decoder=lambda b: None,
+            on_set=lambda k, v: sets.append((k, v)), on_delete=deletes.append,
+        )
+        table._apply(_fake_record(key=b"k", value=b"null"))  # type: ignore[arg-type]
+        assert sets == [("k", None)]
+        assert deletes == []
+
+    def test_hooks_not_called_on_keyless_record(self) -> None:
+        sets: list[object] = []
+        deletes: list[object] = []
+        table = self._bytes_table(on_set=lambda k, v: sets.append((k, v)), on_delete=deletes.append)
+        table._apply(_fake_record(key=None, value=b"x"))  # type: ignore[arg-type]
+        assert sets == [] and deletes == []
+
+    def test_hooks_not_called_on_key_decode_error(self) -> None:
+        def bad_key(b: bytes) -> str:
+            raise ValueError("undecodable key")
+
+        sets: list[object] = []
+        deletes: list[object] = []
+        table = KafkaTable(
+            bootstrap_servers=BOOTSTRAP, topic="unit.hooks.badkey", value_decoder=bytes, key_decoder=bad_key,
+            on_set=lambda k, v: sets.append((k, v)), on_delete=deletes.append,
+        )
+        table._apply(_fake_record(key=b"\xff", value=b"x"))  # type: ignore[arg-type]
+        assert sets == [] and deletes == []
+
+    def test_on_set_not_called_on_value_decode_error(self) -> None:
+        def bad_value(b: bytes) -> object:
+            raise ValueError("undecodable value")
+
+        sets: list[object] = []
+        table = KafkaTable(
+            bootstrap_servers=BOOTSTRAP, topic="unit.hooks.badval", value_decoder=bad_value,
+            on_set=lambda k, v: sets.append((k, v)),
+        )
+        table._apply(_fake_record(key=b"k", value=b"x"))  # type: ignore[arg-type]
+        assert sets == []
+        assert table.stats.value_decode_errors == 1
+
+    def test_apply_does_not_wrap_a_raising_hook(self) -> None:
+        # The deliberate fail-loud decision: _apply must NOT swallow a hook
+        # exception; a genuine observer bug surfaces (and kills the reader).
+        def boom(k: str, v: bytes) -> None:
+            raise RuntimeError("observer bug")
+
+        table = self._bytes_table(on_set=boom)
+        with pytest.raises(RuntimeError, match="observer bug"):
+            table._apply(_fake_record(key=b"k", value=b"v"))  # type: ignore[arg-type]
+
+
 # ---------------------------------------------------------------------------
 # Reader loop — gate extension & barrier sweep, driven via a stub consumer
 # ---------------------------------------------------------------------------
@@ -810,3 +899,16 @@ class TestWriterEnsureTopicDisabled:
         writer = writer_factory(topic, ensure_topic=False)
         async with writer:
             await writer.set("k", make_record("k", 1))
+
+
+async def test_raising_on_set_hook_kills_the_reader(topic: str, table_factory, writer_factory) -> None:
+    # End-to-end: a hook that raises in the reader loop is NOT swallowed. The
+    # unit test pins _apply's no-wrap decision; this confirms the consequence —
+    # the reader task dies and the failure surfaces as status 'failed'.
+    def boom(key: str, value: object) -> None:
+        raise RuntimeError("observer bug")
+
+    async with writer_factory(topic) as writer, table_factory(topic, on_set=boom) as table:
+        await writer.set("k", make_record("k", 1))
+        assert await eventually(lambda: table.status == "failed")
+        assert isinstance(table.failure, RuntimeError)

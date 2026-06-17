@@ -196,6 +196,8 @@ class KafkaTable(Mapping[str, V]):
         poll_timeout_ms: int = 200,
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
+        on_set: Callable[[str, V], None] | None = None,
+        on_delete: Callable[[str], None] | None = None,
     ) -> None:
         if not bootstrap_servers or not topic:
             raise ValueError("bootstrap_servers and topic must be non-empty")
@@ -203,10 +205,18 @@ class KafkaTable(Mapping[str, V]):
             raise ValueError("catchup_timeout must be > 0")
         if not callable(value_decoder) or not callable(key_decoder):
             raise TypeError("value_decoder and key_decoder must be callable")
+        if (on_set is not None and not callable(on_set)) or (on_delete is not None and not callable(on_delete)):
+            raise TypeError("on_set and on_delete must be callable")
         self._bootstrap_servers = bootstrap_servers
         self._topic = topic
         self._value_decoder = value_decoder
         self._key_decoder = key_decoder
+        # Optional apply observers for derived views (e.g. GroupedKafkaTable):
+        # on_set(key, value) fires on an applied value record, on_delete(key) on
+        # a tombstone. Synchronous, fired inside _apply after the dict mutation;
+        # must not raise (a raise kills the reader). See grouped_table.py.
+        self._on_set = on_set
+        self._on_delete = on_delete
         self._catchup_timeout = catchup_timeout
         self._poll_timeout_ms = poll_timeout_ms
         # Idempotent ensure on start: reader or writer may come up first.
@@ -299,6 +309,12 @@ class KafkaTable(Mapping[str, V]):
     @property
     def is_caught_up(self) -> bool:
         return self._caught_up.is_set()
+
+    @property
+    def started(self) -> bool:
+        """True once ``start()`` has begun the reader; stays True after ``stop()``
+        or reader death (the single lifecycle predicate derived views guard on)."""
+        return self._started
 
     async def wait_until_caught_up(self, timeout: float | None = None) -> bool:
         """Wait for replay to reach the start-time end offsets; True if reached.
@@ -518,15 +534,22 @@ class KafkaTable(Mapping[str, V]):
         if record.value is None:  # null value = tombstone (b"" is NOT a tombstone)
             self._data.pop(key, None)
             self._live.tombstones_applied += 1
+            if self._on_delete is not None:
+                self._on_delete(key)
             return
         try:
-            self._data[key] = self._value_decoder(record.value)
+            value = self._value_decoder(record.value)
         except Exception:
             # Poison tolerance: keep the prior value, never kill the reader.
             self._live.value_decode_errors += 1
             logger.exception("undecodable value skipped (key=%s, %s)", key, where)
             return
+        # value MAY be None (a decoder that maps bytes to None) — that is a real
+        # value, NOT a tombstone: tombstones are record.value is None (above).
+        self._data[key] = value
         self._live.records_applied += 1
+        if self._on_set is not None:
+            self._on_set(key, value)
 
     async def _run(
         self,
