@@ -12,6 +12,8 @@ projection, construction guards) need no broker:
 
 from __future__ import annotations
 
+import asyncio
+import time
 import uuid
 from collections.abc import Mapping
 
@@ -36,12 +38,23 @@ from ktables.grouped_table import (
 BOOTSTRAP = "localhost:9092"
 
 # UTF-8-encodable text (no lone surrogates): the codec's str↔(group, member)
-# layer sits beneath the writer's UTF-8 byte layer (spec §6.1 "Layering").
+# layer sits beneath the writer's UTF-8 byte layer.
 _TEXT = st.text(st.characters(codec="utf-8"))
 
 
+async def _eventually(predicate, timeout: float = 5.0, interval: float = 0.01) -> bool:
+    """Poll until ``predicate()`` holds (or timeout). Used to await an
+    asynchronously-induced reader death without a flaky fixed sleep."""
+    deadline = time.perf_counter() + timeout
+    while time.perf_counter() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return predicate()
+
+
 def _build_index(flat: Mapping[str, object], codec: CompositeKeyCodec) -> dict[str, dict[str, object]]:
-    """Reference projection (spec §6.5): the index, by definition, equals this
+    """Reference projection (the equivalence oracle): the index, by definition, equals this
     pure batch function over the inner table's flat mapping. It is the
     equivalence oracle for the incremental maintainer (TestIndexProjection,
     Phase 3). It stores every decoded key's value **including ``None``** — no
@@ -98,11 +111,23 @@ class TestCodec:
     def test_default_key_codec_round_trips(self) -> None:
         assert DEFAULT_KEY_CODEC.decode(DEFAULT_KEY_CODEC.encode("g", "m")) == ("g", "m")
 
-    @given(g1=_TEXT, m1=_TEXT, g2=_TEXT, m2=_TEXT)
-    def test_injective(self, g1: str, m1: str, g2: str, m2: str) -> None:
+    @given(group=_TEXT, member=_TEXT)
+    def test_round_trip_property(self, group: str, member: str) -> None:
+        # Round-trip is the discriminating injectivity check: an information-
+        # losing codec (e.g. one that drops the length prefix) fails this on the
+        # first ambiguous input. Four-independent-draws "injectivity" almost
+        # never draws a colliding pair, so it cannot falsify non-injectivity.
         codec = LengthPrefixedKeyCodec()
-        if (g1, m1) != (g2, m2):
-            assert codec.encode(g1, m1) != codec.encode(g2, m2)
+        assert codec.decode(codec.encode(group, member)) == (group, member)
+
+    @given(pairs=st.lists(st.tuples(_TEXT, _TEXT), max_size=50))
+    def test_injective_no_two_distinct_pairs_share_an_encoding(self, pairs: list[tuple[str, str]]) -> None:
+        # Encoding a *batch* makes collisions reachable: if any two distinct
+        # pairs encoded equal, the encoded set would be smaller than the pair set.
+        codec = LengthPrefixedKeyCodec()
+        distinct = set(pairs)
+        encoded = {codec.encode(group, member) for group, member in distinct}
+        assert len(encoded) == len(distinct)
 
     @pytest.mark.parametrize(
         "key",
@@ -240,10 +265,19 @@ class TestIndexProjection:
         table._index_delete(c.encode("g", "m"))
         assert table._index == {}
 
-    def test_index_delete_of_absent_member_is_noop(self) -> None:
+    def test_index_delete_of_absent_member_in_empty_index_is_noop(self) -> None:
         table = self._table()
         table._index_delete(DEFAULT_KEY_CODEC.encode("g", "missing"))
         assert table._index == {}
+
+    def test_index_delete_of_absent_member_keeps_a_populated_group(self) -> None:
+        # group exists but member doesn't: members.pop is a no-op and the
+        # non-empty group survives (distinct from the last-member-drops-group path).
+        table = self._table()
+        c = DEFAULT_KEY_CODEC
+        table._index_set(c.encode("g", "m"), "v")
+        table._index_delete(c.encode("g", "other"))
+        assert table._index == {"g": {"m": "v"}}
 
     def test_foreign_key_skipped_and_counted_on_both_paths(self) -> None:
         table = self._table()
@@ -411,20 +445,28 @@ class TestGroupedReads:
                 "search": {"c": Endpoint(url="http://c")},
             }
 
-    async def test_members_and_snapshot_return_independent_copies(self, topic, grouped_table_factory, base_writer_factory) -> None:
+    async def test_members_and_snapshot_copy_containers_but_share_values(self, topic, grouped_table_factory, base_writer_factory) -> None:
         codec = DEFAULT_KEY_CODEC
         async with base_writer_factory(topic) as writer:
             await writer.set(codec.encode("g", "m"), Endpoint(url="http://m"))
         async with grouped_table_factory(topic) as table:
             assert await table.barrier()
+            # (a) The returned CONTAINERS are independent copies: mutating the
+            # returned dicts must not affect the table's view.
             members = table.members("g")
             members["injected"] = Endpoint(url="http://evil")
             snap = table.snapshot()
             snap["g"]["injected2"] = Endpoint(url="http://evil2")
             snap["new_group"] = {}
-            # Mutating returned copies must not affect the table's view.
             assert table.members("g") == {"m": Endpoint(url="http://m")}
             assert table.groups() == {"g"}
+            # (b) The VALUE objects are shared by reference (documented contract):
+            # mutating a returned value IS visible on a later read. Locks the
+            # zero-copy-of-values semantics against an accidental deep copy.
+            member = table.get_member("g", "m")
+            assert member is not None
+            member.url = "mutated"
+            assert table.get_member("g", "m").url == "mutated"
 
 
 @pytest.fixture
@@ -491,13 +533,32 @@ class TestGroupedWriteRead:
         assert table.get_member("g", "m") == Endpoint(url="http://m")
         await table.stop()
         # started stays True after stop(): reads serve the frozen view (parity
-        # with base KafkaTable; the same code path serves reads on a failed table).
+        # with base KafkaTable).
         assert table.get_member("g", "m") == Endpoint(url="http://m")
         assert table.groups() == {"g"}
 
+    async def test_reads_on_a_failed_table_serve_the_frozen_view(self, topic, grouped_table_factory, grouped_writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
+        async with grouped_writer_factory(topic) as writer:
+            await writer.set("g", "m", Endpoint(url="http://m"))
+        async with grouped_table_factory(topic) as table:
+            assert await table.barrier()
+            assert table.get_member("g", "m") == Endpoint(url="http://m")
+
+            # Kill the inner reader: the next poll raises a non-retriable error.
+            async def boom(*args: object, **kwargs: object) -> None:
+                raise RuntimeError("induced reader death")
+
+            monkeypatch.setattr(table._table._consumer, "getmany", boom)
+            assert await _eventually(lambda: table.status == "failed")
+            assert table.failure is not None
+            # started stays True after death → reads serve the frozen index,
+            # they do not raise (the documented reads-on-failed path).
+            assert table.get_member("g", "m") == Endpoint(url="http://m")
+            assert table.groups() == {"g"}
+
 
 class TestGroupedForeignKeys:
-    """Foreign keys on a shared topic — spec §6.1 'Shared-topic hazard'."""
+    """Foreign keys on a shared topic — see the dedicated-topic note in the README."""
 
     async def test_non_scheme_key_is_skipped_and_counted(self, topic, bootstrap, grouped_table_factory) -> None:
         async with grouped_table_factory(topic) as table:  # ensures topic + starts

@@ -263,7 +263,7 @@ The reader and writer fix the key byte-layer at UTF-8 and expose only
 | Member | Description |
 |---|---|
 | `CompositeKeyCodec` | Protocol: `encode(group, member) -> str` and `decode(key) -> tuple[str, str] \| None` (`None` = a foreign key, skipped on read). Must be injective and stable across processes. |
-| `LengthPrefixedKeyCodec(separator=":")` | Default codec: `f"{len(group)}:{group}{member}"` — injective for all content, no escaping. |
+| `LengthPrefixedKeyCodec(separator=":")` | Default codec: `f"{len(group)}{separator}{group}{member}"` — injective for all content, no escaping. |
 | `DEFAULT_KEY_CODEC` | The default singleton (`LengthPrefixedKeyCodec()`). |
 
 ### Module level

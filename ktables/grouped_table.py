@@ -126,7 +126,7 @@ class GroupedKafkaTable(Generic[V]):
     ) -> None:
         self._codec = key_codec
         self._index: dict[str, dict[str, V]] = {}
-        self._foreign_key_count = 0
+        self._foreign_key_count: int = 0
         # key_decoder is fixed at UTF-8 (not exposed): the codec owns the
         # str↔(group, member) layer. on_set/on_delete are our own index wiring.
         self._table: KafkaTable[V] = KafkaTable(
@@ -167,8 +167,10 @@ class GroupedKafkaTable(Generic[V]):
     # -- index maintenance (the on_set/on_delete handlers) --------------------
 
     def _decode_or_count(self, key: str) -> tuple[str, str] | None:
-        """Decode the composite key; count + skip foreign/malformed keys. Shared
-        by both hooks so foreign-key tolerance is identical on set and delete."""
+        """Decode the composite key; count + skip foreign keys (``decode → None``,
+        or ``decode`` raised). Shared by both hooks so foreign-key tolerance is
+        identical on set and delete. (Distinct from the base reader's
+        ``key_decode_errors``, which counts undecodable key *bytes* one layer down.)"""
         try:
             decoded = self._codec.decode(key)
         except Exception:  # a codec contract violation is treated as a foreign key
@@ -267,7 +269,12 @@ class GroupedKafkaTable(Generic[V]):
     def foreign_key_count(self) -> int:
         """Records skipped because their key is not a usable (group, member) —
         ``decode → None`` or ``decode`` raised. The grouped analog of
-        ``ViewStats.key_decode_errors``."""
+        ``ViewStats.key_decode_errors``.
+
+        Detects only *shape-invalid* foreign keys: a foreign key that happens to
+        match the codec's shape decodes to a real ``(group, member)`` and silently
+        joins that group — it is NOT counted here and is undetectable in-band, so
+        run a grouped table on a dedicated topic."""
         return self._foreign_key_count
 
     # -- lifecycle / freshness (delegated to the inner table) -----------------
