@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.3.0](https://github.com/ryan-yuuu/ktables/compare/v0.2.0...v0.3.0) (2026-06-17)
+
+
+### Features
+
+* grouped/multimap table (group -&gt; {member -&gt; value}) over a compacted topic ([#17](https://github.com/ryan-yuuu/ktables/issues/17)) ([0b53f8b](https://github.com/ryan-yuuu/ktables/commit/0b53f8bbab56cd4c91561faede5e2257e5e119b8))
+
+
+### Documentation
+
+* fix the CI badge URL after the Tests→CI rename ([#19](https://github.com/ryan-yuuu/ktables/issues/19)) ([655cd7d](https://github.com/ryan-yuuu/ktables/commit/655cd7db2d61e99257c24de5ba9bf46da32bba19))
+* update README ([cd54e92](https://github.com/ryan-yuuu/ktables/commit/cd54e929845f1a1d3cdd7206113cd505c9e3f678))
+
 ## [0.2.0](https://github.com/ryan-yuuu/ktables/compare/v0.1.2...v0.2.0) (2026-06-13)
 
 
