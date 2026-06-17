@@ -15,6 +15,7 @@ dev = [
     "pydantic>=2",
     "typing-extensions>=4.0",
     "testcontainers[kafka]>=4",
+    "hypothesis>=6",
 ]
 
 [build-system]

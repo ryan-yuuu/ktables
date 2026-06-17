@@ -93,6 +93,45 @@ Non-pydantic payloads: construct directly with your own codecs —
 `KafkaTable(..., value_decoder=bytes_to_value)` /
 `KafkaTableWriter(..., value_encoder=value_to_bytes)`.
 
+### Grouped tables
+
+A **grouped table** is a nested `group → {member → value}` view over a single
+compacted topic, where each `(group, member)` pair is its own compaction key.
+It is the race-free way to model a **multi-writer registry**: many independent
+processes each announce their own entry under a shared group, with no
+read-modify-write and no lost updates (every writer owns its own key). The
+"collection per group" is reconstructed in memory on read.
+
+```python
+from ktables import GroupedKafkaTable, GroupedKafkaTableWriter
+
+# Each process announces its own member under a shared group:
+async with GroupedKafkaTableWriter.json(
+    bootstrap_servers="localhost:9092", topic="services", model=ServiceRecord
+) as writer:
+    await writer.set("billing", "host-a", record)   # upsert one member
+    ...
+    await writer.delete("billing", "host-a")         # tombstone one member
+
+# Any reader sees the whole group:
+async with GroupedKafkaTable.json(
+    bootstrap_servers="localhost:9092", topic="services", model=ServiceRecord
+) as table:
+    if await table.barrier():                  # read-your-own-writes, on demand
+        table.get_member("billing", "host-a")  # one member          — O(1)
+        table.members("billing")               # {member: value} map — O(group)
+        table.groups()                         # all group ids
+        table.snapshot()                       # whole nested view    — one O(N) pass
+```
+
+Reads are O(output). To iterate every group use `snapshot()` — **not**
+`for g in table.groups(): table.members(g)`, which re-scans per group.
+
+**Use a dedicated topic.** The composite-key codec is injective, but it cannot
+distinguish your keys from a third party's identically-shaped keys on a shared
+topic (a foreign key matching the scheme would be read as a real member). Give a
+grouped table its own topic.
+
 ### Removing a key on clean shutdown
 
 There is deliberately no `delete_on_close` option (shutdown-time deletion is
@@ -192,6 +231,40 @@ resource handle, not a value.
 The key encoder must be deterministic and stable across processes — on a
 multi-partition topic, per-key ordering holds only if a key always hashes to
 the same partition.
+
+### `GroupedKafkaTable[V]` — grouped read view
+
+| Member | Description |
+|---|---|
+| `GroupedKafkaTable(*, bootstrap_servers, topic, value_decoder, key_codec=DEFAULT_KEY_CODEC, catchup_timeout=30.0, poll_timeout_ms=200, ensure_topic=True, topic_configs=None)` | Construct (does not connect). |
+| `GroupedKafkaTable.json(*, bootstrap_servers, topic, model, key_codec=DEFAULT_KEY_CODEC, **kwargs)` | Preset wiring `model.model_validate_json`. |
+| `get_member(group, member) -> V \| None` / `has_member(group, member) -> bool` | Point lookups — O(1). |
+| `members(group) -> dict[str, V]` | One group's `{member: value}` map (a copy) — O(\|group\|). |
+| `member_count(group) -> int` / `has_group(group) -> bool` / `groups() -> set[str]` | Group-level reads. |
+| `snapshot() -> dict[str, dict[str, V]]` | The whole nested view (a copy) — one O(N) pass. |
+| `foreign_key_count` | Count of records skipped because their key isn't a `(group, member)` of this codec. |
+| `start()` / `stop()` / `async with` / `barrier()` / `wait_until_caught_up()` / `status` / `stats` / `failure` / `is_caught_up` / `started` / `topic` | Delegated to the inner `KafkaTable` — identical semantics. Data reads raise `RuntimeError` before `start()`. |
+
+### `GroupedKafkaTableWriter[V]`
+
+| Member | Description |
+|---|---|
+| `GroupedKafkaTableWriter(*, bootstrap_servers, topic, value_encoder, key_codec=DEFAULT_KEY_CODEC, ensure_topic=True, topic_configs=None, enable_idempotence=True)` | Construct. |
+| `GroupedKafkaTableWriter.json(*, bootstrap_servers, topic, model=None, key_codec=DEFAULT_KEY_CODEC, **kwargs)` | Preset encoding via `model_dump_json()`. |
+| `set(group, member, value)` | Upsert one member (LWW per member); awaits broker ack. |
+| `delete(group, member)` | Tombstone one member; awaits broker ack. |
+| `start()` / `stop()` / `async with` | Lifecycle. |
+
+The reader and writer fix the key byte-layer at UTF-8 and expose only
+`key_codec` (the `(group, member)` ↔ key layer); both run on a dedicated topic.
+
+### Composite-key codec
+
+| Member | Description |
+|---|---|
+| `CompositeKeyCodec` | Protocol: `encode(group, member) -> str` and `decode(key) -> tuple[str, str] \| None` (`None` = a foreign key, skipped on read). Must be injective and stable across processes. |
+| `LengthPrefixedKeyCodec(separator=":")` | Default codec: `f"{len(group)}{separator}{group}{member}"` — injective for all content, no escaping. |
+| `DEFAULT_KEY_CODEC` | The default singleton (`LengthPrefixedKeyCodec()`). |
 
 ### Module level
 
