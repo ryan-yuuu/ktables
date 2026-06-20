@@ -2,7 +2,7 @@
 
 See the kafka_table module docstring for the consistency contract and
 design notes, and README.md for usage. Grouped tables (a nested
-``group → {member → value}`` view over a compacted topic) live in
+``{group: {member: value}}`` view over a compacted topic) live in
 ``grouped_table`` and are re-exported here.
 """
 

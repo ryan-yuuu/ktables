@@ -1,6 +1,6 @@
 """M3/M4 — write latency and throughput (the writer in isolation; no reader).
 
-M3 write latency: time each ``await writer.set()`` (publish→ack) sequentially.
+M3 write latency: time each ``await writer.set()`` (publish-to-ack) sequentially.
 M4 throughput: sustained records/s with a sweep of pipelined in-flight depth
 (depth 1 == naive sequential), plus the per-record latency observed at that depth.
 

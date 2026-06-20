@@ -37,8 +37,8 @@ from ktables.grouped_table import (
 # they never connect). Integration tests bind the live broker via fixtures.
 BOOTSTRAP = "localhost:9092"
 
-# UTF-8-encodable text (no lone surrogates): the codec's str↔(group, member)
-# layer sits beneath the writer's UTF-8 byte layer.
+# UTF-8-encodable text (no lone surrogates): the codec's mapping between the str key and
+# (group, member) sits beneath the writer's UTF-8 byte layer.
 _TEXT = st.text(st.characters(codec="utf-8"))
 
 
@@ -192,6 +192,13 @@ class TestGroupedConstruction:
                 bootstrap_servers=BOOTSTRAP, topic="unit.grouped", value_decoder=bytes,
                 **{reserved: (lambda *a: None)},  # type: ignore[arg-type]
             )
+
+    def test_fetch_max_wait_ms_forwarded_to_inner_table(self) -> None:
+        # The grouped table forwards the knob to the KafkaTable it composes.
+        default = GroupedKafkaTable(bootstrap_servers=BOOTSTRAP, topic="unit.grouped.fmw", value_decoder=bytes)
+        custom = GroupedKafkaTable(bootstrap_servers=BOOTSTRAP, topic="unit.grouped.fmw", value_decoder=bytes, fetch_max_wait_ms=10)
+        assert default._table._fetch_max_wait_ms == 500
+        assert custom._table._fetch_max_wait_ms == 10
 
 
 class TestGroupedUnstartedGuards:
@@ -501,7 +508,7 @@ class TestGroupedWriteRead:
             assert table.members("g") == {"m2": Endpoint(url="http://2")}
             assert table.has_group("g")
 
-            await writer.delete("g", "m2")  # last member → group vanishes
+            await writer.delete("g", "m2")  # last member gone, the group vanishes
             assert await table.barrier()
             assert not table.has_group("g")
             assert table.groups() == set()
@@ -551,7 +558,7 @@ class TestGroupedWriteRead:
             monkeypatch.setattr(table._table._consumer, "getmany", boom)
             assert await _eventually(lambda: table.status == "failed")
             assert table.failure is not None
-            # started stays True after death → reads serve the frozen index,
+            # started stays True after death, so reads serve the frozen index,
             # they do not raise (the documented reads-on-failed path).
             assert table.get_member("g", "m") == Endpoint(url="http://m")
             assert table.groups() == {"g"}

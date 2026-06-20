@@ -24,6 +24,7 @@ high-churn state.
 - [Usage](#usage)
 - [Consistency contract](#consistency-contract)
 - [API](#api)
+- [Performance](#performance)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -95,7 +96,7 @@ Non-pydantic payloads: construct directly with your own codecs —
 
 ### Grouped tables
 
-A **grouped table** is a nested `group → {member → value}` view over a single
+A **grouped table** is a nested `{group: {member: value}}` view over a single
 compacted topic, where each `(group, member)` pair is its own compaction key.
 It is the race-free way to model a **multi-writer registry**: many independent
 processes each announce their own entry under a shared group, with no
@@ -190,6 +191,16 @@ wait, or a broker error while snapshotting. It raises `RuntimeError` only on
 lifecycle misuse (table never started, or already stopped). Runtime partition
 expansion is out of scope — the guarantee covers the call-time assignment.
 
+**Barrier latency.** On a table that is actively consuming, `barrier()` resolves
+in ~1 ms. On a **quiet** table it is slower — its latency is approximately
+`max(fetch_max_wait_ms, poll_timeout_ms)`: the end-offset snapshot waits behind the
+consumer's in-flight fetch long-poll (`fetch_max_wait_ms`, default 500 ms) and the
+reader then resolves it on its next poll (`poll_timeout_ms`, default 200 ms). To
+minimize barrier latency on quiet tables, lower **both** knobs (e.g.
+`fetch_max_wait_ms=10, poll_timeout_ms=20` takes the idle barrier from ~500 ms to
+~30 ms) — at the cost of more frequent fetches and reader wake-ups (broker traffic
+and CPU). Leave the defaults unless fast read-your-own-writes on idle tables matters.
+
 A tombstone is a record with a **null** value (`b""` is data, not a tombstone).
 If the background reader dies (non-retriable error, e.g. authorization),
 contents freeze at the last applied state: `status` becomes `"failed"` and
@@ -205,6 +216,24 @@ lives in **[docs/API.md](docs/API.md)**: `KafkaTable` / `KafkaTableWriter`, the
 grouped `GroupedKafkaTable` / `GroupedKafkaTableWriter`, the composite-key codec,
 and the module-level helpers (`ensure_topic`, `ViewStats`, `SupportsJsonModel`,
 `TableStatus`, `DEFAULT_TOPIC_CONFIGS`).
+
+<br>
+
+## Performance
+
+ktables adds negligible latency over the raw Kafka client — propagation (publish to
+read) and write latency (publish to ack) are within measurement noise of bare
+`aiokafka`, and reads are in-memory `dict` operations. The one tunable cost is `barrier()` on a *quiet* table; see the
+[Consistency contract](#consistency-contract) for the
+`max(fetch_max_wait_ms, poll_timeout_ms)` barrier-latency model.
+
+For measured numbers and perf tuning:
+
+- **[Performance report](benchmarks/REPORT.md)** — propagation, `barrier()`, write
+  latency/throughput, catch-up, memory, and reader-CPU results, the raw-Kafka
+  baseline delta, run-to-run stability, and tuning guidance.
+- **[Benchmark suite](benchmarks/README.md)** — how to run it (profiles, the
+  testcontainers Redpanda broker) and reproduce the numbers.
 
 <br>
 

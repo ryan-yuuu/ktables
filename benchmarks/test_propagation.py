@@ -1,4 +1,4 @@
-"""M1 — write→read propagation latency (publish → visible in the reader's dict).
+"""M1 — write-to-read propagation latency (publish to visible in the reader's dict).
 
 This module currently implements the **same-process baseline** (writer and reader
 in one event loop), per the plan's topology sequencing (§12.3): build the
@@ -143,7 +143,7 @@ async def test_propagation_raw_kafka_baseline(
     bootstrap: str,
     bench_results: dict,
 ) -> None:
-    """M7 — the same publish→consume latency through a bare aiokafka producer +
+    """M7 — the same publish-to-consume latency through a bare aiokafka producer +
     consumer (no ktables). Subtract from the same-process M1 cell to isolate
     ktables' overhead over raw Kafka."""
     warmup, measured = _COUNTS.get(PROFILE, _COUNTS["quick"])

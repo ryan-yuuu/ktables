@@ -1,4 +1,4 @@
-"""M5 — cold-start / time-to-usable-view (start() → caught_up).
+"""M5 — cold-start / time-to-usable-view (start() to caught_up).
 
 Preload a topic with N records, then time a fresh table's ``start()``. The total
 wall-clock is decomposed into connect/metadata + ``catch_up_seconds`` (the reader's

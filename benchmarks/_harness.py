@@ -336,7 +336,7 @@ def stamping_encoder(payload_size: int) -> Callable[[int], bytes]:
 
 
 class PropagationProbe:
-    """An instrumented :class:`~ktables.KafkaTable` for measuring publish→visible
+    """An instrumented :class:`~ktables.KafkaTable` for measuring publish-to-visible
     latency. Its ``on_set`` decodes the embedded send timestamp and records
     ``t_apply - t_send`` — but only while :attr:`recording` is on, so warm-up
     records are excluded from the measured distribution.
@@ -391,7 +391,7 @@ class PropagationProbe:
 
 
 class RawPropagationBaseline:
-    """Publish→consume latency through a **bare** aiokafka consumer (no ktables),
+    """Publish-to-consume latency through a **bare** aiokafka consumer (no ktables),
     kwargs-matched to KafkaTable (:data:`BASELINE_CONSUMER_KWARGS` + the same
     ``poll_timeout_ms`` and ``seek_to_beginning``), so ktables' propagation can be
     reported as a delta over raw Kafka. Mirrors :class:`PropagationProbe`'s

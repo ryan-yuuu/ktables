@@ -1,7 +1,7 @@
 """Composite-key codec and grouped table for ktables.
 
 A *grouped table* materializes a single compacted topic as a nested
-``group → {member → value}`` view, where each ``(group, member)`` pair is an
+``{group: {member: value}}`` view, where each ``(group, member)`` pair is an
 independent compaction key. That one-key-per-member layout is what makes a
 multi-writer registry race-free: no two writers ever share a key, so there is no
 read-modify-write and no lost update (the standard alternative — a single key
@@ -9,8 +9,8 @@ whose value is the whole collection — loses updates under concurrent writers).
 The nested "collection per group" is reconstructed on read, in memory, in each
 consumer.
 
-This module's :class:`CompositeKeyCodec` is the injective ``(group, member) ↔
-flat key`` mapping the convention rests on, with :class:`LengthPrefixedKeyCodec`
+This module's :class:`CompositeKeyCodec` is the injective, invertible mapping between ``(group, member)`` pairs and flat
+keys the convention rests on, with :class:`LengthPrefixedKeyCodec`
 as the collision-proof default. :class:`GroupedKafkaTable` (reader) and
 :class:`GroupedKafkaTableWriter` (writer) compose the base
 :class:`~ktables.kafka_table.KafkaTable` / ``KafkaTableWriter`` over that codec,
@@ -97,10 +97,10 @@ DEFAULT_KEY_CODEC: CompositeKeyCodec = LengthPrefixedKeyCodec()
 
 
 class GroupedKafkaTable(Generic[V]):
-    """A nested ``group → {member → value}`` view over a compacted topic.
+    """A nested ``{group: {member: value}}`` view over a compacted topic.
 
     Composes (never subclasses) :class:`~ktables.kafka_table.KafkaTable`: the
-    inner table materializes the flat ``encode(group, member) → value`` topic,
+    inner table materializes the flat ``encode(group, member)``-keyed topic,
     and ``on_set``/``on_delete`` hooks maintain an incremental nested index so
     grouped reads are O(output) — point lookups O(1), single-group O(|group|),
     the whole view one O(N) ``snapshot()``. All the base table's guarantees
@@ -121,6 +121,7 @@ class GroupedKafkaTable(Generic[V]):
         key_codec: CompositeKeyCodec = DEFAULT_KEY_CODEC,
         catchup_timeout: float = 30.0,
         poll_timeout_ms: int = 200,
+        fetch_max_wait_ms: int = 500,
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
     ) -> None:
@@ -128,13 +129,14 @@ class GroupedKafkaTable(Generic[V]):
         self._index: dict[str, dict[str, V]] = {}
         self._foreign_key_count: int = 0
         # key_decoder is fixed at UTF-8 (not exposed): the codec owns the
-        # str↔(group, member) layer. on_set/on_delete are our own index wiring.
+        # mapping between the str key and (group, member). on_set/on_delete are our own index wiring.
         self._table: KafkaTable[V] = KafkaTable(
             bootstrap_servers=bootstrap_servers,
             topic=topic,
             value_decoder=value_decoder,
             catchup_timeout=catchup_timeout,
             poll_timeout_ms=poll_timeout_ms,
+            fetch_max_wait_ms=fetch_max_wait_ms,
             ensure_topic=ensure_topic,
             topic_configs=topic_configs,
             on_set=self._index_set,
@@ -167,7 +169,7 @@ class GroupedKafkaTable(Generic[V]):
     # -- index maintenance (the on_set/on_delete handlers) --------------------
 
     def _decode_or_count(self, key: str) -> tuple[str, str] | None:
-        """Decode the composite key; count + skip foreign keys (``decode → None``,
+        """Decode the composite key; count + skip foreign keys (``decode`` returns ``None``,
         or ``decode`` raised). Shared by both hooks so foreign-key tolerance is
         identical on set and delete. (Distinct from the base reader's
         ``key_decode_errors``, which counts undecodable key *bytes* one layer down.)"""
@@ -196,7 +198,7 @@ class GroupedKafkaTable(Generic[V]):
         members = self._index.get(group)
         if members is not None:
             members.pop(member, None)
-            if not members:  # last member gone → group vanishes
+            if not members:  # last member gone, the group vanishes
                 del self._index[group]
 
     # -- read API (synchronous, point-in-time copies) -------------------------
@@ -268,7 +270,7 @@ class GroupedKafkaTable(Generic[V]):
     @property
     def foreign_key_count(self) -> int:
         """Records skipped because their key is not a usable (group, member) —
-        ``decode → None`` or ``decode`` raised. The grouped analog of
+        ``decode`` returns ``None`` or ``decode`` raised. The grouped analog of
         ``ViewStats.key_decode_errors``.
 
         Detects only *shape-invalid* foreign keys: a foreign key that happens to
@@ -309,7 +311,7 @@ class GroupedKafkaTableWriter(Generic[V]):
     and ``delete(group, member)`` tombstones that one key. Because every
     ``(group, member)`` is a distinct key, independent writers never share a key:
     no read-modify-write, no lost update. Registry-grade durability
-    (``enable_idempotence`` ⇒ ``acks=all``) and lifecycle are the inner writer's.
+    (``enable_idempotence`` implies ``acks=all``) and lifecycle are the inner writer's.
     """
 
     def __init__(
@@ -326,7 +328,7 @@ class GroupedKafkaTableWriter(Generic[V]):
         self._codec = key_codec
         self._topic = topic
         # key_encoder is fixed at UTF-8 (not exposed): the codec owns the
-        # str↔(group, member) layer (mirrors GroupedKafkaTable).
+        # mapping between the str key and (group, member) (mirrors GroupedKafkaTable).
         self._writer: KafkaTableWriter[V] = KafkaTableWriter(
             bootstrap_servers=bootstrap_servers,
             topic=topic,
