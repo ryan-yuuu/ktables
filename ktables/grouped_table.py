@@ -9,8 +9,8 @@ whose value is the whole collection — loses updates under concurrent writers).
 The nested "collection per group" is reconstructed on read, in memory, in each
 consumer.
 
-This module's :class:`CompositeKeyCodec` is the injective ``(group, member) ↔
-flat key`` mapping the convention rests on, with :class:`LengthPrefixedKeyCodec`
+This module's :class:`CompositeKeyCodec` is the injective, invertible mapping between ``(group, member)`` pairs and flat
+keys the convention rests on, with :class:`LengthPrefixedKeyCodec`
 as the collision-proof default. :class:`GroupedKafkaTable` (reader) and
 :class:`GroupedKafkaTableWriter` (writer) compose the base
 :class:`~ktables.kafka_table.KafkaTable` / ``KafkaTableWriter`` over that codec,
@@ -129,7 +129,7 @@ class GroupedKafkaTable(Generic[V]):
         self._index: dict[str, dict[str, V]] = {}
         self._foreign_key_count: int = 0
         # key_decoder is fixed at UTF-8 (not exposed): the codec owns the
-        # str↔(group, member) layer. on_set/on_delete are our own index wiring.
+        # mapping between the str key and (group, member). on_set/on_delete are our own index wiring.
         self._table: KafkaTable[V] = KafkaTable(
             bootstrap_servers=bootstrap_servers,
             topic=topic,
@@ -328,7 +328,7 @@ class GroupedKafkaTableWriter(Generic[V]):
         self._codec = key_codec
         self._topic = topic
         # key_encoder is fixed at UTF-8 (not exposed): the codec owns the
-        # str↔(group, member) layer (mirrors GroupedKafkaTable).
+        # mapping between the str key and (group, member) (mirrors GroupedKafkaTable).
         self._writer: KafkaTableWriter[V] = KafkaTableWriter(
             bootstrap_servers=bootstrap_servers,
             topic=topic,

@@ -59,7 +59,7 @@ the same partition.
 | `start()` / `stop()` / `async with` | Lifecycle. |
 
 The reader and writer fix the key byte-layer at UTF-8 and expose only
-`key_codec` (the `(group, member)` ↔ key layer); both run on a dedicated topic.
+`key_codec` (the layer mapping `(group, member)` pairs to and from flat keys); both run on a dedicated topic.
 
 ## Composite-key codec
 

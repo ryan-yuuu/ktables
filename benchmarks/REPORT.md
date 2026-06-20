@@ -206,7 +206,7 @@ above flat**, not 2×.
 
 | operation | sizes and min latency | complexity |
 |---|---|---|
-| `get_member` / `has_member` | ~120 ns, flat across 1k↔100k | O(1) ✓ |
+| `get_member` / `has_member` | ~120 ns, flat from 1k to 100k | O(1) ✓ |
 | `members(group)` | 10: 157 ns · 100: 389 ns · 1000: 2000 ns | O(\|group\|) ✓ |
 | `groups()` | 100: 732 ns · 1k: 6.8 µs · 10k: 116 µs | O(#groups) ✓ |
 | `snapshot()` flat / grouped | 1k: 2.0/3.3 µs · 100k: 324/530 µs | O(N) ✓ |

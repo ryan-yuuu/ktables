@@ -37,8 +37,8 @@ from ktables.grouped_table import (
 # they never connect). Integration tests bind the live broker via fixtures.
 BOOTSTRAP = "localhost:9092"
 
-# UTF-8-encodable text (no lone surrogates): the codec's str↔(group, member)
-# layer sits beneath the writer's UTF-8 byte layer.
+# UTF-8-encodable text (no lone surrogates): the codec's mapping between the str key and
+# (group, member) sits beneath the writer's UTF-8 byte layer.
 _TEXT = st.text(st.characters(codec="utf-8"))
 
 
