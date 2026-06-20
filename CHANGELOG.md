@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/ryan-yuuu/ktables/compare/v0.3.0...v0.4.0) (2026-06-20)
+
+
+### Features
+
+* expose fetch_max_wait_ms to tune barrier latency ([#23](https://github.com/ryan-yuuu/ktables/issues/23)) ([46d0b08](https://github.com/ryan-yuuu/ktables/commit/46d0b08975f5237dd9296d09a1a46c8a695169f9))
+
 ## [0.3.0](https://github.com/ryan-yuuu/ktables/compare/v0.2.0...v0.3.0) (2026-06-17)
 
 
