@@ -24,6 +24,7 @@ high-churn state.
 - [Usage](#usage)
 - [Consistency contract](#consistency-contract)
 - [API](#api)
+- [Performance](#performance)
 - [Contributing](#contributing)
 - [License](#license)
 
@@ -215,6 +216,24 @@ lives in **[docs/API.md](docs/API.md)**: `KafkaTable` / `KafkaTableWriter`, the
 grouped `GroupedKafkaTable` / `GroupedKafkaTableWriter`, the composite-key codec,
 and the module-level helpers (`ensure_topic`, `ViewStats`, `SupportsJsonModel`,
 `TableStatus`, `DEFAULT_TOPIC_CONFIGS`).
+
+<br>
+
+## Performance
+
+ktables adds negligible latency over the raw Kafka client — publish→visible and
+publish→ack are within measurement noise of bare `aiokafka`, and reads are in-memory
+`dict` operations. The one tunable cost is `barrier()` on a *quiet* table; see the
+[Consistency contract](#consistency-contract) for the
+`max(fetch_max_wait_ms, poll_timeout_ms)` barrier-latency model.
+
+For measured numbers and perf tuning:
+
+- **[Performance report](benchmarks/REPORT.md)** — propagation, `barrier()`, write
+  latency/throughput, catch-up, memory, and reader-CPU results, the raw-Kafka
+  baseline delta, run-to-run stability, and tuning guidance.
+- **[Benchmark suite](benchmarks/README.md)** — how to run it (profiles, the
+  testcontainers Redpanda broker) and reproduce the numbers.
 
 <br>
 
