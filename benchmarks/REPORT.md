@@ -14,7 +14,7 @@ A point-in-time run of the `full` benchmark profile. Numbers are **comparative**
 | Profile | `full` |
 | Date | 2026-06-19 |
 | Duration | 49 min (80 benchmarks) |
-| Host | Apple M3 Pro |
+| Host | Apple M3 Pro — 11-core (5 performance + 6 efficiency), 36 GB RAM (macOS, arm64) |
 | Broker | Redpanda v25.3.15 — **single node, RF=1, loopback** (testcontainers) |
 | Runtime | Python 3.12.7 · aiokafka 0.14.0 · ktables 0.3.0 |
 
