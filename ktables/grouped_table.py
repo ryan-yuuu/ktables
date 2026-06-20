@@ -311,7 +311,7 @@ class GroupedKafkaTableWriter(Generic[V]):
     and ``delete(group, member)`` tombstones that one key. Because every
     ``(group, member)`` is a distinct key, independent writers never share a key:
     no read-modify-write, no lost update. Registry-grade durability
-    (``enable_idempotence`` ⇒ ``acks=all``) and lifecycle are the inner writer's.
+    (``enable_idempotence`` implies ``acks=all``) and lifecycle are the inner writer's.
     """
 
     def __init__(
