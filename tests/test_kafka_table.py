@@ -63,7 +63,7 @@ def make_writer(topic: str) -> KafkaTableWriter[ServiceRecord]:
 
 
 async def eventually(predicate, timeout: float = 5.0, interval: float = 0.005) -> bool:
-    """Poll until ``predicate()`` is true — publish→visible is eventually
+    """Poll until ``predicate()`` is true — publish-to-visible is eventually
     consistent (no read-your-own-writes), so tests must never bare-read."""
     deadline = time.perf_counter() + timeout
     while time.perf_counter() < deadline:
@@ -397,7 +397,7 @@ async def test_barrier_times_out_to_false_without_leaking(topic: str, table_fact
 
 async def test_barrier_returns_false_on_snapshot_error(topic: str, table_factory, writer_factory, monkeypatch: pytest.MonkeyPatch) -> None:
     async with table_factory(topic) as table:
-        # (a) broker error while snapshotting → False, never raised, never registered.
+        # (a) broker error while snapshotting yields False, never raised, never registered.
         async def boom(partitions, *args, **kwargs):
             raise KafkaError("induced ListOffsets failure")
 
@@ -406,7 +406,7 @@ async def test_barrier_returns_false_on_snapshot_error(topic: str, table_factory
         assert table._barriers == []
         assert table.status == "caught_up"
 
-        # (b) snapshot that hangs past the timeout → also False (whole-call budget).
+        # (b) snapshot that hangs past the timeout, also False (whole-call budget).
         async def hang(partitions, *args, **kwargs):
             await asyncio.sleep(3600)
 

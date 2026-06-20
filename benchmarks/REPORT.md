@@ -62,7 +62,7 @@ A point-in-time run of the `full` benchmark profile. Numbers are **comparative**
 
 ## Full results
 
-### M1 — propagation latency (publish → visible)
+### M1 — propagation latency (publish to visible)
 
 Same-process, sequential writes; stamped via the `on_set` hook (`CLOCK_MONOTONIC`).
 
@@ -80,7 +80,7 @@ Same-process, sequential writes; stamped via the `on_set` hook (`CLOCK_MONOTONIC
 *(ms.)* Propagation is **flat across `poll_timeout_ms`** — the background fetcher
 (`fetch_min_bytes=1`) wakes the poll early on data.
 
-### M7 — raw-aiokafka baseline → ktables overhead
+### M7 — raw-aiokafka baseline and ktables overhead
 
 | poll | payload | parts | ktables p50 / p99 | raw p50 / p99 | Δ p50 / Δ p99 |
 |---:|---:|---:|---:|---:|---:|
@@ -137,7 +137,7 @@ into the consumer; 30 samples/cell.
 in-flight Fetch at a random phase of its long-poll). Lowering *both* knobs takes the
 idle barrier from ~700 ms to ~30 ms — a ~24× reduction.
 
-### M3 — write latency (publish → ack)
+### M3 — write latency (publish to ack)
 
 | payload | partitions | idempotence | p50 | p99 | sequential rps |
 |---:|---:|:---:|---:|---:|---:|
@@ -161,7 +161,7 @@ idle barrier from ~700 ms to ~30 ms — a ~24× reduction.
 
 *(ms.)* Peaks at depth ≈ 64; depth 256 regresses.
 
-### M5 — cold-start catch-up (start() → caught_up)
+### M5 — cold-start catch-up (start() to caught_up)
 
 | kind | N | decoder | total (ms) | replay (ms) | connect (ms) | replay rps |
 |---|---:|---|---:|---:|---:|---:|
@@ -204,7 +204,7 @@ above flat**, not 2×.
 
 ### M6 — in-memory read cost (validates O(·) claims)
 
-| operation | sizes → min latency | complexity |
+| operation | sizes and min latency | complexity |
 |---|---|---|
 | `get_member` / `has_member` | ~120 ns, flat across 1k↔100k | O(1) ✓ |
 | `members(group)` | 10: 157 ns · 100: 389 ns · 1000: 2000 ns | O(\|group\|) ✓ |
@@ -230,7 +230,7 @@ and you are gated by whichever knob is larger:
 | **lower both (fmw 10, poll 20)** | **~30 ms** |
 
 **Meaning:** to minimize barrier latency on a *quiet* table, lower **both**
-`fetch_max_wait_ms` and `poll_timeout_ms` — ~24× faster (~700 → ~30 ms). The cost is
+`fetch_max_wait_ms` and `poll_timeout_ms` — ~24× faster (~700 to ~30 ms). The cost is
 more frequent fetches and reader wake-ups (broker traffic + CPU; M9). Barriers are
 already ~1 ms when the table is actively consuming. **`fetch_max_wait_ms` is now a
 `KafkaTable`/`GroupedKafkaTable` constructor parameter** (it was previously pinned to
@@ -266,7 +266,7 @@ The grouped index duplicates **keys and structure**, not values. *(The grouped
 trustworthy.)*
 
 ### 7. The poll latency/CPU trade-off, quantified
-Idle reader CPU runs 0.46% → 1.71% of a core as `poll_timeout_ms` drops 500 → 20 ms.
+Idle reader CPU runs 0.46% to 1.71% of a core as `poll_timeout_ms` drops 500 to 20 ms.
 Lowering `poll_timeout_ms` helps the *resolution* half of the barrier (and
 propagation-under-load); lowering `fetch_max_wait_ms` helps the *snapshot* half.
 
@@ -275,7 +275,7 @@ propagation-under-load); lowering `fetch_max_wait_ms` helps the *snapshot* half.
 ## Recommendations / tuning guidance
 
 - **Fast `barrier()` on quiet tables**: set both `fetch_max_wait_ms` and
-  `poll_timeout_ms` low (e.g. 10 / 20 ms → ~20 ms idle barrier), weighing the
+  `poll_timeout_ms` low (e.g. 10 / 20 ms gives a ~30 ms idle barrier), weighing the
   fetch/CPU cost. Both are constructor parameters.
 - **Write throughput**: pipeline ~64 writes in flight; don't exceed it.
 - **Propagation under your own load**: don't co-locate a heavy writer with a reader

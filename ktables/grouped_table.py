@@ -1,7 +1,7 @@
 """Composite-key codec and grouped table for ktables.
 
 A *grouped table* materializes a single compacted topic as a nested
-``group → {member → value}`` view, where each ``(group, member)`` pair is an
+``{group: {member: value}}`` view, where each ``(group, member)`` pair is an
 independent compaction key. That one-key-per-member layout is what makes a
 multi-writer registry race-free: no two writers ever share a key, so there is no
 read-modify-write and no lost update (the standard alternative — a single key
@@ -97,10 +97,10 @@ DEFAULT_KEY_CODEC: CompositeKeyCodec = LengthPrefixedKeyCodec()
 
 
 class GroupedKafkaTable(Generic[V]):
-    """A nested ``group → {member → value}`` view over a compacted topic.
+    """A nested ``{group: {member: value}}`` view over a compacted topic.
 
     Composes (never subclasses) :class:`~ktables.kafka_table.KafkaTable`: the
-    inner table materializes the flat ``encode(group, member) → value`` topic,
+    inner table materializes the flat ``encode(group, member)``-keyed topic,
     and ``on_set``/``on_delete`` hooks maintain an incremental nested index so
     grouped reads are O(output) — point lookups O(1), single-group O(|group|),
     the whole view one O(N) ``snapshot()``. All the base table's guarantees
@@ -169,7 +169,7 @@ class GroupedKafkaTable(Generic[V]):
     # -- index maintenance (the on_set/on_delete handlers) --------------------
 
     def _decode_or_count(self, key: str) -> tuple[str, str] | None:
-        """Decode the composite key; count + skip foreign keys (``decode → None``,
+        """Decode the composite key; count + skip foreign keys (``decode`` returns ``None``,
         or ``decode`` raised). Shared by both hooks so foreign-key tolerance is
         identical on set and delete. (Distinct from the base reader's
         ``key_decode_errors``, which counts undecodable key *bytes* one layer down.)"""
@@ -198,7 +198,7 @@ class GroupedKafkaTable(Generic[V]):
         members = self._index.get(group)
         if members is not None:
             members.pop(member, None)
-            if not members:  # last member gone → group vanishes
+            if not members:  # last member gone, the group vanishes
                 del self._index[group]
 
     # -- read API (synchronous, point-in-time copies) -------------------------
@@ -270,7 +270,7 @@ class GroupedKafkaTable(Generic[V]):
     @property
     def foreign_key_count(self) -> int:
         """Records skipped because their key is not a usable (group, member) —
-        ``decode → None`` or ``decode`` raised. The grouped analog of
+        ``decode`` returns ``None`` or ``decode`` raised. The grouped analog of
         ``ViewStats.key_decode_errors``.
 
         Detects only *shape-invalid* foreign keys: a foreign key that happens to

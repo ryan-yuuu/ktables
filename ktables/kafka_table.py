@@ -22,7 +22,7 @@ Verified design facts (traced through aiokafka 0.13.0 source during review):
 Consistency contract (the four guarantees):
 1. After ``start()``/``async with``: complete as of the start-time end offsets
    (unless ``status == "degraded"`` — catch-up timed out, view may be partial).
-2. Thereafter: eventually consistent; publish→visible is typically a few ms.
+2. Thereafter: eventually consistent; publish-to-visible is typically a few ms.
 3. Contents are stable between *your* awaits (single event loop; only the
    reader task mutates). ``snapshot()`` for copies you hold across awaits.
 4. NO read-your-own-writes: after ``await writer.set(k, v)``, a local

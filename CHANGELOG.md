@@ -10,7 +10,7 @@
 
 ### Documentation
 
-* fix the CI badge URL after the Tests→CI rename ([#19](https://github.com/ryan-yuuu/ktables/issues/19)) ([655cd7d](https://github.com/ryan-yuuu/ktables/commit/655cd7db2d61e99257c24de5ba9bf46da32bba19))
+* fix the CI badge URL after the Tests-to-CI rename ([#19](https://github.com/ryan-yuuu/ktables/issues/19)) ([655cd7d](https://github.com/ryan-yuuu/ktables/commit/655cd7db2d61e99257c24de5ba9bf46da32bba19))
 * update README ([cd54e92](https://github.com/ryan-yuuu/ktables/commit/cd54e929845f1a1d3cdd7206113cd505c9e3f678))
 
 ## [0.2.0](https://github.com/ryan-yuuu/ktables/compare/v0.1.2...v0.2.0) (2026-06-13)

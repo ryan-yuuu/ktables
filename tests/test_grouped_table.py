@@ -508,7 +508,7 @@ class TestGroupedWriteRead:
             assert table.members("g") == {"m2": Endpoint(url="http://2")}
             assert table.has_group("g")
 
-            await writer.delete("g", "m2")  # last member → group vanishes
+            await writer.delete("g", "m2")  # last member gone, the group vanishes
             assert await table.barrier()
             assert not table.has_group("g")
             assert table.groups() == set()
@@ -558,7 +558,7 @@ class TestGroupedWriteRead:
             monkeypatch.setattr(table._table._consumer, "getmany", boom)
             assert await _eventually(lambda: table.status == "failed")
             assert table.failure is not None
-            # started stays True after death → reads serve the frozen index,
+            # started stays True after death, so reads serve the frozen index,
             # they do not raise (the documented reads-on-failed path).
             assert table.get_member("g", "m") == Endpoint(url="http://m")
             assert table.groups() == {"g"}
