@@ -28,6 +28,38 @@ A point-in-time run of the `full` benchmark profile. Numbers are **comparative**
 6. **Grouped tables cost ~17–21% more RAM than flat** (the index duplicates keys/structure but *shares* values) — *not* 2×.
 7. **Every documented O(·) read complexity holds.**
 
+## Methodology
+
+- **Instrumentation.** Propagation (M1) is timed via the `on_set` hook fired inside
+  `_apply` — the instant a record becomes visible to reads — using system-wide
+  `CLOCK_MONOTONIC` (comparable across the cross-process writer). `barrier()`, write
+  latency, throughput, catch-up, and reader CPU are timed directly around the call.
+  Percentiles come from **HdrHistogram** (1 µs … 600 s, 3 significant figures);
+  out-of-range samples are counted, never silently dropped.
+- **Coordinated omission.** The **open-loop** M1 cells are CO-corrected
+  (`record_corrected_value`, expected interval = the send period). **Closed-loop**
+  metrics (sequential M1, M2 barrier, M3 write) measure service time and use plain
+  recording. Open-loop cells that could not sustain the target rate are flagged
+  *saturated* and quarantined out of the trustworthy results.
+- **Warm-up + sample budget** (full profile). Warm-up records/iterations are
+  discarded before measurement; sent vs stamped samples are reconciled (a lost
+  sample fails the cell).
+
+  | metric | warm-up | measured (per cell) | note |
+  |---|---:|---|---|
+  | M1 propagation / M7 baseline | 500 | 10,000 | sequential, closed-loop |
+  | M1 open-loop | — | 5,000 records | CO-corrected |
+  | M2 barrier idle / after-burst / churn | 1 | 1,000 / 200 / 1,000 | |
+  | M2 concurrent | 1 | 800 (100 rounds × 8) | |
+  | M3 write latency | 50 | 5,000 | |
+  | M4 throughput | 50 | 20,000 | |
+  | M2b experiment | 1 | 30 | |
+  | **M5 catch-up · M8 memory · M9 CPU** | — | **1 (single-shot)** | run-to-run noise only |
+  | M6 reads | pytest-benchmark | auto-calibrated rounds | min for O(1), median for O(N) |
+
+  Latency metrics (M1–M3) therefore have tight within-run estimates; M5/M8/M9 are a
+  single measurement per cell, so their only noise estimate is run-to-run (below).
+
 ## Full results
 
 ### M1 — propagation latency (publish → visible)
@@ -250,6 +282,39 @@ propagation-under-load); lowering `fetch_max_wait_ms` helps the *snapshot* half.
   in the same process if tail latency matters.
 - **Catch-up / memory at scale**: prefer a cheap decoder; budget ~(payload + 100 B)/key
   flat and ~20% more for grouped.
+
+## Run-to-run stability (measurement noise)
+
+The result tables above are a single `full` run. To bound run-to-run noise, the
+table below is the dispersion of repeated **`quick`-profile** runs (11 runs). Quick
+uses smaller per-cell samples, so these CVs **upper-bound** the full-profile latency
+noise; the single-shot metrics (M5/M8/M9) carry the run-to-run noise shown directly.
+
+| metric (cell) | runs | median | range | CV% |
+|---|---:|---:|---:|---:|
+| barrier idle (poll 200) p50 | 3 | 402.9 ms | 402.7–403.2 | **0%** |
+| barrier after-burst (B=100) p50 | 3 | 201.9 ms | 201.7–202.1 | **0%** |
+| barrier concurrent p50 | 3 | 201.5 ms | 201.3–201.5 | **0%** |
+| barrier churn p50 | 3 | 1.08 ms | 1.02–1.26 | 9% |
+| propagation raw-baseline p50 | 4 | 0.67 ms | 0.65–0.76 | 6% |
+| propagation same-process p50 | 5 | 0.69 ms | 0.68–0.88 | 11% |
+| propagation open-loop p50 | 5 | 0.55 ms | 0.47–0.72 | 9–16% |
+| write latency p50 | 4 | 0.38 ms | 0.27–0.63 | **36%** |
+| write throughput latency p50 | 4 | 2.49 ms | 1.47–2.70 | 22% |
+| catch-up flat 1k (total) | 4 | 10.6 ms | 5.6–14.1 | 30% |
+| catch-up grouped 1k (total) | 4 | 9.9 ms | 8.9–13.1 | 15% |
+| memory dict B/key (flat & grouped) | 2 | — | exact | **0%** |
+| reader idle CPU | 3 | — | tiny abs. | 35–38% |
+
+**Takeaways:** timer-gated metrics (barrier idle/after-burst/concurrent) and the
+exact `dict_bytes` memory walk are **deterministic** (CV ~0%) — trust them tightly.
+The sub-millisecond latencies (propagation, write) and tiny CPU fractions carry high
+*relative* jitter only because the absolute values sit near the measurement floor
+(±0.1 ms on a 0.3 ms write is ±33%, though the absolute noise is small) — read their
+p50s as ±10–35% and lean on p99 trends and the cross-/same-process and
+ktables-vs-raw **deltas**. Single-shot catch-up at small N is ±30% run-to-run
+(connect/metadata variance dominates). *(Visualizations are not included — this
+report is tables-only.)*
 
 ## Caveats & threats to validity
 
