@@ -5,17 +5,17 @@ Performance benchmarks for ktables, run against a **real Redpanda broker**
 [`notes/ktables-benchmark-test-plan.md`](../notes/ktables-benchmark-test-plan.md).
 
 These numbers are **comparative** — for regression tracking and tuning guidance
-(e.g. "lowering `poll_timeout_ms` cut p99 propagation X→Y"), **not** production
+(e.g. "lowering `poll_timeout_ms` cut p99 propagation from X to Y"), **not** production
 SLAs. See [Caveats](#caveats).
 
 ## What it measures
 
 | Metric | Question | Module |
 |---|---|---|
-| **M1** propagation | publish → visible in a reader's dict | `test_propagation.py` |
+| **M1** propagation | a record becomes visible in a reader's dict | `test_propagation.py` |
 | **M2** barrier | how long `barrier()` takes | `test_barrier.py` |
-| **M3/M4** write | publish→ack latency; sustained throughput | `test_write.py` |
-| **M5** catch-up | `start()` → caught up (time-to-usable view) | `test_catchup.py` |
+| **M3/M4** write | publish-to-ack latency; sustained throughput | `test_write.py` |
+| **M5** catch-up | `start()` to caught up (time-to-usable view) | `test_catchup.py` |
 | **M6** reads | in-memory read cost (validates the O(·) claims) | `test_reads_micro.py` |
 | **M7** baseline | the same, through bare aiokafka (ktables as a delta) | in M1/M3 modules |
 | **M8** memory | bytes/key held in RAM (flat vs grouped) | `test_memory.py` |
@@ -82,7 +82,7 @@ suite uses pytest-benchmark's own `--benchmark-json`.
   (`fetch_max_wait_ms`, default 500 ms) and the reader resolves it on its next poll
   (`poll_timeout_ms`). Idle ≈ 500 ms by default, after-burst/concurrent ≈ 1× poll,
   and **~1 ms under churn**. To minimize it, lower **both** knobs
-  (`fetch_max_wait_ms=10, poll_timeout_ms=20` → ~30 ms, a ~20× cut) at the cost of
+  (`fetch_max_wait_ms=10, poll_timeout_ms=20` gives ~30 ms, a ~20× cut) at the cost of
   more fetches/wakeups (see M9). *(An earlier note here said "idle ≈ 2× poll"; the
   full-profile sweep showed it is `fetch_max_wait_ms`-gated, not poll-scaled.)*
 - **Same-process co-location biases propagation in the tail**: at rate 1000/s,
@@ -98,7 +98,7 @@ suite uses pytest-benchmark's own `--benchmark-json`.
 - **Single-node Redpanda, RF=1, loopback.** `acks=all` is a local write, so write
   latency **understates** a replicated (RF≥3) cluster, and there is no cross-host
   network.
-- **Docker/testcontainers host noise** → high tail variance; pin/quiet the host
+- **Docker/testcontainers host noise** causes high tail variance; pin/quiet the host
   for stable p99.9. The HDR ceiling + dropped-sample counter prevent a stalled run
   from silently improving the reported tail.
 - **Topology**: M1/M7 measure both same-process (a service that also reads) and

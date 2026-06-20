@@ -96,7 +96,7 @@ Non-pydantic payloads: construct directly with your own codecs —
 
 ### Grouped tables
 
-A **grouped table** is a nested `group → {member → value}` view over a single
+A **grouped table** is a nested `{group: {member: value}}` view over a single
 compacted topic, where each `(group, member)` pair is its own compaction key.
 It is the race-free way to model a **multi-writer registry**: many independent
 processes each announce their own entry under a shared group, with no
@@ -221,9 +221,9 @@ and the module-level helpers (`ensure_topic`, `ViewStats`, `SupportsJsonModel`,
 
 ## Performance
 
-ktables adds negligible latency over the raw Kafka client — publish→visible and
-publish→ack are within measurement noise of bare `aiokafka`, and reads are in-memory
-`dict` operations. The one tunable cost is `barrier()` on a *quiet* table; see the
+ktables adds negligible latency over the raw Kafka client — propagation (publish to
+read) and write latency (publish to ack) are within measurement noise of bare
+`aiokafka`, and reads are in-memory `dict` operations. The one tunable cost is `barrier()` on a *quiet* table; see the
 [Consistency contract](#consistency-contract) for the
 `max(fetch_max_wait_ms, poll_timeout_ms)` barrier-latency model.
 
