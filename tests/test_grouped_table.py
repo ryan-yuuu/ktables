@@ -193,6 +193,13 @@ class TestGroupedConstruction:
                 **{reserved: (lambda *a: None)},  # type: ignore[arg-type]
             )
 
+    def test_fetch_max_wait_ms_forwarded_to_inner_table(self) -> None:
+        # The grouped table forwards the knob to the KafkaTable it composes.
+        default = GroupedKafkaTable(bootstrap_servers=BOOTSTRAP, topic="unit.grouped.fmw", value_decoder=bytes)
+        custom = GroupedKafkaTable(bootstrap_servers=BOOTSTRAP, topic="unit.grouped.fmw", value_decoder=bytes, fetch_max_wait_ms=10)
+        assert default._table._fetch_max_wait_ms == 500
+        assert custom._table._fetch_max_wait_ms == 10
+
 
 class TestGroupedUnstartedGuards:
     def test_reads_raise_before_start(self) -> None:

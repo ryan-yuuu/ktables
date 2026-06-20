@@ -190,6 +190,16 @@ wait, or a broker error while snapshotting. It raises `RuntimeError` only on
 lifecycle misuse (table never started, or already stopped). Runtime partition
 expansion is out of scope — the guarantee covers the call-time assignment.
 
+**Barrier latency.** On a table that is actively consuming, `barrier()` resolves
+in ~1 ms. On a **quiet** table it is slower — its latency is approximately
+`max(fetch_max_wait_ms, poll_timeout_ms)`: the end-offset snapshot waits behind the
+consumer's in-flight fetch long-poll (`fetch_max_wait_ms`, default 500 ms) and the
+reader then resolves it on its next poll (`poll_timeout_ms`, default 200 ms). To
+minimize barrier latency on quiet tables, lower **both** knobs (e.g.
+`fetch_max_wait_ms=10, poll_timeout_ms=20` takes the idle barrier from ~500 ms to
+~30 ms) — at the cost of more frequent fetches and reader wake-ups (broker traffic
+and CPU). Leave the defaults unless fast read-your-own-writes on idle tables matters.
+
 A tombstone is a record with a **null** value (`b""` is data, not a tombstone).
 If the background reader dies (non-retriable error, e.g. authorization),
 contents freeze at the last applied state: `status` becomes `"failed"` and

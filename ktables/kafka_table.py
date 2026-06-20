@@ -194,6 +194,7 @@ class KafkaTable(Mapping[str, V]):
         key_decoder: Callable[[bytes], str] = _utf8_decode,
         catchup_timeout: float = 30.0,
         poll_timeout_ms: int = 200,
+        fetch_max_wait_ms: int = 500,
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
         on_set: Callable[[str, V], None] | None = None,
@@ -219,6 +220,13 @@ class KafkaTable(Mapping[str, V]):
         self._on_delete = on_delete
         self._catchup_timeout = catchup_timeout
         self._poll_timeout_ms = poll_timeout_ms
+        # The consumer's fetch long-poll. On a *quiet* table, idle barrier() latency
+        # is ~max(fetch_max_wait_ms, poll_timeout_ms): barrier()'s end_offsets() waits
+        # behind the in-flight fetch (~fetch_max_wait_ms) and the reader resolves it on
+        # its next getmany() (~poll_timeout_ms). Lower BOTH to minimize barrier latency;
+        # the cost is more frequent fetches/wakeups (broker traffic + reader CPU). The
+        # default mirrors aiokafka's.
+        self._fetch_max_wait_ms = fetch_max_wait_ms
         # Idempotent ensure on start: reader or writer may come up first.
         # Disable where the app lacks topic-create ACLs (see ensure_topic()).
         self._ensure_topic = ensure_topic
@@ -430,6 +438,7 @@ class KafkaTable(Mapping[str, V]):
             group_id=None,
             enable_auto_commit=False,
             auto_offset_reset="earliest",
+            fetch_max_wait_ms=self._fetch_max_wait_ms,
         )
         await consumer.start()
         self._consumer = consumer

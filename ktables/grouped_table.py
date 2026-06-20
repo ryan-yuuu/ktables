@@ -121,6 +121,7 @@ class GroupedKafkaTable(Generic[V]):
         key_codec: CompositeKeyCodec = DEFAULT_KEY_CODEC,
         catchup_timeout: float = 30.0,
         poll_timeout_ms: int = 200,
+        fetch_max_wait_ms: int = 500,
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
     ) -> None:
@@ -135,6 +136,7 @@ class GroupedKafkaTable(Generic[V]):
             value_decoder=value_decoder,
             catchup_timeout=catchup_timeout,
             poll_timeout_ms=poll_timeout_ms,
+            fetch_max_wait_ms=fetch_max_wait_ms,
             ensure_topic=ensure_topic,
             topic_configs=topic_configs,
             on_set=self._index_set,

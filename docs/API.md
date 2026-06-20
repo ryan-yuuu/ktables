@@ -7,7 +7,7 @@ see the [README](../README.md).
 
 | Member | Description |
 |---|---|
-| `KafkaTable(*, bootstrap_servers, topic, value_decoder, key_decoder=utf-8, catchup_timeout=30.0, poll_timeout_ms=200, ensure_topic=True, topic_configs=None)` | Construct (does not connect). |
+| `KafkaTable(*, bootstrap_servers, topic, value_decoder, key_decoder=utf-8, catchup_timeout=30.0, poll_timeout_ms=200, fetch_max_wait_ms=500, ensure_topic=True, topic_configs=None)` | Construct (does not connect). |
 | `KafkaTable.json(*, bootstrap_servers, topic, model, **kwargs)` | Preset wiring `model.model_validate_json` as the decoder. |
 | `start()` / `stop()` / `async with` | Lifecycle. `start()` raises on double-start, missing topic, or reader death during catch-up; on catch-up *timeout* it serves degraded. |
 | `table[key]`, `key in table`, `iter`, `len`, `.get(key, default=None)` | Mapping reads. Raise `RuntimeError` before `start()`. |
@@ -15,7 +15,7 @@ see the [README](../README.md).
 | `status` | `"unstarted" \| "loading" \| "caught_up" \| "degraded" \| "failed"`. |
 | `failure` | Exception that killed the reader, else `None`. |
 | `is_caught_up` / `wait_until_caught_up(timeout=None)` | Catch-up gate; the wait returns `False` on timeout or reader death. |
-| `barrier(timeout=None)` | On-demand read-your-own-writes: `True` once every write acked before the call is visible; `False` on timeout/reader death/`stop()`/broker-snapshot error. Raises only on lifecycle misuse. |
+| `barrier(timeout=None)` | On-demand read-your-own-writes: `True` once every write acked before the call is visible; `False` on timeout/reader death/`stop()`/broker-snapshot error. Raises only on lifecycle misuse. On a **quiet** table its latency is ≈ `max(fetch_max_wait_ms, poll_timeout_ms)` (~1 ms while the table is actively consuming); lower both knobs to minimize it. |
 | `stats` | Frozen `ViewStats` snapshot (see below). |
 
 Equality is **identity** and instances are hashable: a running table is a
@@ -39,7 +39,7 @@ the same partition.
 
 | Member | Description |
 |---|---|
-| `GroupedKafkaTable(*, bootstrap_servers, topic, value_decoder, key_codec=DEFAULT_KEY_CODEC, catchup_timeout=30.0, poll_timeout_ms=200, ensure_topic=True, topic_configs=None)` | Construct (does not connect). |
+| `GroupedKafkaTable(*, bootstrap_servers, topic, value_decoder, key_codec=DEFAULT_KEY_CODEC, catchup_timeout=30.0, poll_timeout_ms=200, fetch_max_wait_ms=500, ensure_topic=True, topic_configs=None)` | Construct (does not connect). |
 | `GroupedKafkaTable.json(*, bootstrap_servers, topic, model, key_codec=DEFAULT_KEY_CODEC, **kwargs)` | Preset wiring `model.model_validate_json`. |
 | `get_member(group, member) -> V \| None` / `has_member(group, member) -> bool` | Point lookups — O(1). |
 | `members(group) -> dict[str, V]` | One group's `{member: value}` map (a copy) — O(\|group\|). |

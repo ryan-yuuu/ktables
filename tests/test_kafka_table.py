@@ -104,6 +104,18 @@ class TestConstruction:
             KafkaTable(bootstrap_servers="b", topic="t", value_decoder=bytes, on_delete="nope")  # type: ignore[arg-type]
 
 
+class TestFetchMaxWait:
+    """fetch_max_wait_ms tunes the consumer's fetch long-poll — a dominant term in
+    barrier() latency on a quiet table (alongside poll_timeout_ms)."""
+
+    def test_defaults_to_aiokafka_500ms(self) -> None:
+        assert make_table("unit.fmw")._fetch_max_wait_ms == 500
+
+    def test_custom_value_is_stored(self) -> None:
+        table = KafkaTable.json(bootstrap_servers=BOOTSTRAP, topic="unit.fmw", model=ServiceRecord, fetch_max_wait_ms=10)
+        assert table._fetch_max_wait_ms == 10
+
+
 class TestUnstartedGuards:
     def test_reads_raise_before_start(self) -> None:
         table = make_table("unit.never.started")
@@ -217,6 +229,14 @@ async def test_double_start_raises(topic: str, table_factory, writer_factory) ->
     async with table_factory(topic) as table:
         with pytest.raises(RuntimeError, match="already started"):
             await table.start()
+
+
+async def test_fetch_max_wait_ms_reaches_the_consumer(topic: str, table_factory, writer_factory) -> None:
+    # The knob must actually plumb through to the AIOKafkaConsumer — it gates the
+    # fetch long-poll, the dominant term in idle barrier() latency.
+    table = table_factory(topic, fetch_max_wait_ms=10)
+    async with table:
+        assert table._consumer._fetch_max_wait_ms == 10
 
 
 async def test_cold_start_replays_lww_over_uncompacted_history(topic: str, table_factory, writer_factory) -> None:
