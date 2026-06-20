@@ -5,8 +5,8 @@
 | Name                      |    Stmts |     Miss |   Branch |   BrPart |    Cover |   Missing |
 |-------------------------- | -------: | -------: | -------: | -------: | -------: | --------: |
 | ktables/grouped\_table.py |      149 |        0 |       18 |        0 |     100% |           |
-| ktables/kafka\_table.py   |      348 |        0 |       96 |        0 |     100% |           |
-| **TOTAL**                 |  **497** |    **0** |  **114** |    **0** | **100%** |           |
+| ktables/kafka\_table.py   |      349 |        0 |       96 |        0 |     100% |           |
+| **TOTAL**                 |  **498** |    **0** |  **114** |    **0** | **100%** |           |
 
 
 ## Setup coverage badge
