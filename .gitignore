@@ -218,3 +218,6 @@ __marimo__/
 .streamlit/secrets.toml
 
 notes/
+
+# Benchmark result artifacts (see benchmarks/README.md)
+results/
