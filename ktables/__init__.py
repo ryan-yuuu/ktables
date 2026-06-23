@@ -15,10 +15,14 @@ from ktables.grouped_table import (
 )
 from ktables.kafka_table import (
     DEFAULT_TOPIC_CONFIGS,
+    EnsureTopicOutcome,
+    EnsureTopicResult,
     KafkaTable,
     KafkaTableWriter,
+    PolicyMismatchAction,
     SupportsJsonModel,
     TableStatus,
+    TopicConfigMismatchError,
     ViewStats,
     ensure_topic,
 )
@@ -27,13 +31,17 @@ __all__ = [
     "CompositeKeyCodec",
     "DEFAULT_KEY_CODEC",
     "DEFAULT_TOPIC_CONFIGS",
+    "EnsureTopicOutcome",
+    "EnsureTopicResult",
     "GroupedKafkaTable",
     "GroupedKafkaTableWriter",
     "KafkaTable",
     "KafkaTableWriter",
     "LengthPrefixedKeyCodec",
+    "PolicyMismatchAction",
     "SupportsJsonModel",
     "TableStatus",
+    "TopicConfigMismatchError",
     "ViewStats",
     "ensure_topic",
 ]

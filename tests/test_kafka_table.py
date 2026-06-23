@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import dataclasses
+import logging
 import time
 import types
 import uuid
@@ -19,12 +21,33 @@ from datetime import datetime, timezone
 
 import pytest
 from aiokafka import AIOKafkaConsumer, TopicPartition
-from aiokafka.admin import AIOKafkaAdminClient
-from aiokafka.errors import IllegalStateError, KafkaError, TopicAlreadyExistsError
+from aiokafka.admin import AIOKafkaAdminClient, NewTopic
+from aiokafka.admin.config_resource import ConfigResource, ConfigResourceType
+from aiokafka.errors import (
+    IllegalStateError,
+    InvalidConfigurationError,
+    KafkaConnectionError,
+    KafkaError,
+    TopicAlreadyExistsError,
+    TopicAuthorizationFailedError,
+)
 from pydantic import AwareDatetime, BaseModel
 
 from ktables import KafkaTable, KafkaTableWriter, ViewStats
-from ktables.kafka_table import ensure_topic
+from ktables.kafka_table import (
+    EnsureTopicResult,
+    TopicConfigMismatchError,
+    _check_topic_policy,
+    _explicit_overrides,
+    _policy_from_entries,
+    _raise_for_code,
+    _reconcile_policy,
+    _requires_compaction,
+    _satisfies_compaction,
+    _split_policy,
+    _try_create_topic,
+    ensure_topic,
+)
 
 # Placeholder address for pure-unit tests that construct a table/writer but
 # never start() it (so they never connect). Integration tests get the real
@@ -504,6 +527,400 @@ async def test_barrier_accounts_for_decode_skipped_records(topic: str, table_fac
 
 
 # ---------------------------------------------------------------------------
+# Pure policy helpers (no broker) — used by the on_policy_mismatch machinery
+# ---------------------------------------------------------------------------
+
+
+class TestPublicExports:
+    @pytest.mark.parametrize(
+        "name",
+        ["PolicyMismatchAction", "EnsureTopicOutcome", "EnsureTopicResult", "TopicConfigMismatchError"],
+    )
+    def test_reconciliation_symbols_are_public(self, name: str) -> None:
+        import ktables
+
+        assert name in ktables.__all__
+        assert hasattr(ktables, name)
+
+
+class TestSplitPolicy:
+    @pytest.mark.parametrize(
+        "raw",
+        ["compact", "compact,delete", "delete,compact", "delete, compact", " compact "],
+    )
+    def test_compact_recognized_regardless_of_order_or_whitespace(self, raw: str) -> None:
+        assert "compact" in _split_policy(raw)
+
+    def test_delete_only_has_no_compact(self) -> None:
+        assert "compact" not in _split_policy("delete")
+
+
+class TestRequiresCompaction:
+    @pytest.mark.parametrize("expected", [None, "", "delete"])
+    def test_non_compacting_declarations_do_not_require_compaction(self, expected) -> None:
+        assert _requires_compaction(expected) is False
+
+    @pytest.mark.parametrize("expected", ["compact", "compact,delete"])
+    def test_compacting_declarations_require_compaction(self, expected: str) -> None:
+        assert _requires_compaction(expected) is True
+
+
+class TestSatisfiesCompaction:
+    @pytest.mark.parametrize("actual", ["compact", "compact,delete", "delete,compact"])
+    def test_policies_containing_compact_satisfy(self, actual: str) -> None:
+        assert _satisfies_compaction(actual) is True
+
+    def test_delete_only_does_not_satisfy(self) -> None:
+        assert _satisfies_compaction("delete") is False
+
+
+class TestExplicitOverrides:
+    """describe_configs entry shapes (verified against aiokafka 0.14.0):
+    v1+ entry = (name, value, read_only, config_source:int, is_sensitive, synonyms)
+                where config_source == 1 means TOPIC_CONFIG (an explicit override);
+    v0  entry = (name, value, read_only, is_default:bool, is_sensitive).
+    """
+
+    def test_v1_keeps_only_topic_source_writable_set_overrides(self) -> None:
+        entries = [
+            ("retention.ms", "1000", False, 1, False, []),  # topic override -> kept
+            ("segment.bytes", "99", False, 1, False, []),  # topic override -> kept
+            ("max.message.bytes", "1048588", False, 5, False, []),  # default source -> dropped
+            ("flush.ms", "0", True, 1, False, []),  # read_only -> dropped
+            ("some.null", None, False, 1, False, []),  # value None -> dropped
+        ]
+        assert _explicit_overrides(entries) == {"retention.ms": "1000", "segment.bytes": "99"}
+
+    def test_v0_keeps_only_non_default_writable_overrides(self) -> None:
+        entries = [
+            ("retention.ms", "1000", False, False, False),  # is_default False -> kept
+            ("max.message.bytes", "1048588", False, True, False),  # is_default True -> dropped
+            ("flush.ms", "0", True, False, False),  # read_only -> dropped
+        ]
+        assert _explicit_overrides(entries) == {"retention.ms": "1000"}
+
+
+class TestTopicConfigMismatchError:
+    def test_stores_fields_and_names_them_in_message(self) -> None:
+        err = TopicConfigMismatchError("my-topic", "compact", "delete")
+        assert err.topic == "my-topic"
+        assert err.expected == "compact"
+        assert err.actual == "delete"
+        text = str(err)
+        assert "my-topic" in text
+        assert "compact" in text
+        assert "delete" in text
+
+    def test_is_a_plain_exception_not_under_a_ktables_base(self) -> None:
+        # DX decision: no KTablesError base; the error stands alone on Exception.
+        assert issubclass(TopicConfigMismatchError, Exception)
+        assert TopicConfigMismatchError.__mro__[1] is Exception
+
+
+class TestEnsureTopicResult:
+    def test_carries_outcome_and_policy(self) -> None:
+        result = EnsureTopicResult(outcome="reconciled", policy="delete")
+        assert result.outcome == "reconciled"
+        assert result.policy == "delete"
+
+    def test_is_frozen(self) -> None:
+        result = EnsureTopicResult(outcome="created", policy=None)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            result.outcome = "verified"  # type: ignore[misc]
+
+    def test_uses_slots_no_instance_dict(self) -> None:
+        assert not hasattr(EnsureTopicResult(outcome="skipped", policy=None), "__dict__")
+
+    def test_equality_by_value(self) -> None:
+        assert EnsureTopicResult("verified", "compact") == EnsureTopicResult("verified", "compact")
+        assert EnsureTopicResult("verified", "compact") != EnsureTopicResult("mismatch", "delete")
+
+
+class TestRaiseForCode:
+    def test_zero_is_noop(self) -> None:
+        assert _raise_for_code(0, "ignored") is None
+
+    def test_nonzero_raises_mapped_exception_with_broker_message(self) -> None:
+        with pytest.raises(InvalidConfigurationError, match="bad config value"):
+            _raise_for_code(40, "bad config value")
+
+    def test_none_message_does_not_render_as_none(self) -> None:
+        with pytest.raises(TopicAuthorizationFailedError) as excinfo:
+            _raise_for_code(29, None)
+        assert "None" not in str(excinfo.value)
+
+
+class _FakeAdminClient:
+    """Faithful stand-in for AIOKafkaAdminClient, mirroring the real response
+    shapes (verified against aiokafka 0.13.0 and 0.14.0):
+
+    * ``create_topics``  -> obj with ``.topic_errors = [(name, code[, message])]``
+    * ``describe_configs`` -> ``[obj(resources=[(code, msg, type, name, entries)])]``
+    * ``alter_configs``  -> ``[obj(resources=[(code, msg, type, name)])]``
+
+    Each method returns its configured response, or raises its configured
+    exception. Call counts and the last ``alter_configs`` payload are recorded.
+    """
+
+    def __init__(
+        self,
+        *,
+        create=None,
+        describe=None,
+        alter=None,
+        start_exc=None,
+    ) -> None:
+        self._create = create
+        self._describe = describe
+        self._alter = alter
+        self._start_exc = start_exc
+        self.closed = False
+        self.create_calls = 0
+        self.describe_calls = 0
+        self.alter_calls = 0
+        self.altered_configs: dict | None = None
+
+    @staticmethod
+    def _resolve(spec):
+        if isinstance(spec, Exception):
+            raise spec
+        return spec
+
+    async def start(self) -> None:
+        if self._start_exc is not None:
+            raise self._start_exc
+
+    async def create_topics(self, new_topics) -> object:
+        self.create_calls += 1
+        return self._resolve(self._create)
+
+    async def describe_configs(self, config_resources, include_synonyms=False) -> object:
+        self.describe_calls += 1
+        return self._resolve(self._describe)
+
+    async def alter_configs(self, config_resources) -> object:
+        self.alter_calls += 1
+        self.altered_configs = dict(config_resources[0].configs)
+        return self._resolve(self._alter)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _create_response(topic_errors):
+    return types.SimpleNamespace(topic_errors=topic_errors)
+
+
+def _describe_response(entries, *, code=0, msg=""):
+    """A describe_configs return: list[Response], each with .resources of
+    (error_code, error_message, resource_type, resource_name, config_entries)."""
+    return [types.SimpleNamespace(resources=[(code, msg, 2, "t", entries)])]
+
+
+def _alter_response(*, code=0, msg=""):
+    """An alter_configs return: list[Response], each .resources of
+    (error_code, error_message, resource_type, resource_name)."""
+    return [types.SimpleNamespace(resources=[(code, msg, 2, "t")])]
+
+
+_OVERRIDE_ENTRIES = [
+    ("cleanup.policy", "delete", False, 1, False, []),
+    ("retention.ms", "1234567", False, 1, False, []),
+    ("segment.bytes", "10485760", False, 1, False, []),
+]
+
+
+def _entries_with_policy(policy, overrides=None):
+    entries = [("cleanup.policy", policy, False, 1, False, [])]
+    for key, value in (overrides or {}).items():
+        entries.append((key, value, False, 1, False, []))
+    return entries
+
+
+class TestTryCreateTopic:
+    async def test_code_zero_means_created_and_logs(self, caplog: pytest.LogCaptureFixture) -> None:
+        admin = _FakeAdminClient(create=_create_response([("t", 0, "")]))
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            created = await _try_create_topic(admin, "t", 1, 1, {"cleanup.policy": "compact"})
+        assert created is True
+        assert any("created topic" in r.message for r in caplog.records)
+
+    async def test_code_36_means_exists_and_does_not_log_created(self, caplog: pytest.LogCaptureFixture) -> None:
+        # Bug #1 regression: a real broker returns 36 in-band, NOT by raising.
+        admin = _FakeAdminClient(create=_create_response([("t", 36, "The topic has already been created")]))
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            created = await _try_create_topic(admin, "t", 1, 1, {"cleanup.policy": "compact"})
+        assert created is False
+        assert not any("created topic" in r.message for r in caplog.records)
+
+    async def test_other_nonzero_code_raises_with_broker_message(self) -> None:
+        admin = _FakeAdminClient(create=_create_response([("t", 29, "Not authorized to access topics: [t]")]))
+        with pytest.raises(TopicAuthorizationFailedError, match="Not authorized"):
+            await _try_create_topic(admin, "t", 1, 1, {"cleanup.policy": "compact"})
+
+    async def test_v0_topic_errors_tuple_without_message(self) -> None:
+        # CreateTopicsResponse v0 element is (name, code) — no message field.
+        admin = _FakeAdminClient(create=_create_response([("t", 36)]))
+        assert await _try_create_topic(admin, "t", 1, 1, {"cleanup.policy": "compact"}) is False
+
+    async def test_defensive_topic_already_exists_exception_means_exists(self) -> None:
+        admin = _FakeAdminClient(create=TopicAlreadyExistsError())
+        assert await _try_create_topic(admin, "t", 1, 1, {"cleanup.policy": "compact"}) is False
+
+
+class TestPolicyFromEntries:
+    def test_returns_cleanup_policy_value(self) -> None:
+        entries = [
+            ("retention.ms", "1000", False, 1, False, []),
+            ("cleanup.policy", "compact,delete", False, 1, False, []),
+        ]
+        assert _policy_from_entries(entries) == "compact,delete"
+
+    def test_returns_none_when_policy_absent(self) -> None:
+        assert _policy_from_entries([("retention.ms", "1000", False, 1, False, [])]) is None
+
+    def test_returns_none_for_empty(self) -> None:
+        assert _policy_from_entries([]) is None
+
+
+class TestReconcilePolicy:
+    async def test_merges_compact_over_preserved_overrides_in_one_alter(self) -> None:
+        admin = _FakeAdminClient(alter=_alter_response())
+        await _reconcile_policy(admin, "t", "compact", _OVERRIDE_ENTRIES)
+        assert admin.alter_calls == 1
+        assert admin.altered_configs == {
+            "cleanup.policy": "compact",
+            "retention.ms": "1234567",
+            "segment.bytes": "10485760",
+        }
+
+    async def test_success_logs_preserved_override_count(self, caplog: pytest.LogCaptureFixture) -> None:
+        admin = _FakeAdminClient(alter=_alter_response())
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            await _reconcile_policy(admin, "t", "compact", _OVERRIDE_ENTRIES)
+        msgs = [r.message for r in caplog.records if "reconciled topic" in r.message]
+        assert len(msgs) == 1
+        assert "preserved 2 override" in msgs[0]
+
+    async def test_inband_alter_rejection_raises_and_does_not_log_success(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        admin = _FakeAdminClient(alter=_alter_response(code=29, msg="Not authorized"))
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            with pytest.raises(TopicAuthorizationFailedError, match="Not authorized"):
+                await _reconcile_policy(admin, "t", "compact", _OVERRIDE_ENTRIES)
+        assert not any("reconciled topic" in r.message for r in caplog.records)
+
+
+class TestCheckTopicPolicyVerifiedAndMismatch:
+    async def test_compact_is_verified_without_alter_or_retention_log(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        admin = _FakeAdminClient(describe=_describe_response(_entries_with_policy("compact")))
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            result = await _check_topic_policy(admin, "t", "compact", "warn")
+        assert result == EnsureTopicResult("verified", "compact")
+        assert admin.alter_calls == 0
+        assert not any("retention" in r.message for r in caplog.records)
+
+    async def test_compact_delete_is_verified_with_retention_info(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        admin = _FakeAdminClient(describe=_describe_response(_entries_with_policy("compact,delete")))
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            result = await _check_topic_policy(admin, "t", "compact", "warn")
+        assert result == EnsureTopicResult("verified", "compact,delete")
+        retention = [r for r in caplog.records if "retention" in r.message]
+        assert len(retention) == 1
+        assert retention[0].levelno == logging.INFO
+
+    async def test_mismatch_warn_logs_warning_and_returns_mismatch(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        admin = _FakeAdminClient(describe=_describe_response(_entries_with_policy("delete")))
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            result = await _check_topic_policy(admin, "t", "compact", "warn")
+        assert result == EnsureTopicResult("mismatch", "delete")
+        assert admin.alter_calls == 0
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "compact" in warnings[0].message  # the required policy is interpolated
+
+    async def test_mismatch_raise_raises_with_fields(self) -> None:
+        admin = _FakeAdminClient(describe=_describe_response(_entries_with_policy("delete")))
+        with pytest.raises(TopicConfigMismatchError) as excinfo:
+            await _check_topic_policy(admin, "t", "compact", "raise")
+        assert (excinfo.value.topic, excinfo.value.expected, excinfo.value.actual) == ("t", "compact", "delete")
+
+    async def test_mismatch_reconcile_alters_and_returns_pre_reconcile_policy(self) -> None:
+        admin = _FakeAdminClient(
+            describe=_describe_response(_entries_with_policy("delete", {"retention.ms": "1234567"})),
+            alter=_alter_response(),
+        )
+        result = await _check_topic_policy(admin, "t", "compact", "reconcile")
+        assert result == EnsureTopicResult("reconciled", "delete")  # policy is the PRE-reconcile value
+        assert admin.alter_calls == 1
+        assert admin.altered_configs == {"cleanup.policy": "compact", "retention.ms": "1234567"}
+
+
+class TestCheckTopicPolicyUnverifiable:
+    @pytest.mark.parametrize("code", [29, 3])
+    async def test_inband_describe_error_warn_is_info_unreadable(
+        self, code: int, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        admin = _FakeAdminClient(describe=_describe_response([], code=code, msg="denied"))
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            result = await _check_topic_policy(admin, "t", "compact", "warn")
+        assert result == EnsureTopicResult("unreadable", None)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+        assert any("could not verify" in r.message and r.levelno == logging.INFO for r in caplog.records)
+
+    async def test_inband_describe_error_raise_propagates(self) -> None:
+        admin = _FakeAdminClient(describe=_describe_response([], code=29, msg="denied"))
+        with pytest.raises(TopicAuthorizationFailedError):
+            await _check_topic_policy(admin, "t", "compact", "raise")
+
+    async def test_inband_describe_error_reconcile_propagates(self) -> None:
+        admin = _FakeAdminClient(describe=_describe_response([], code=3, msg="missing"))
+        with pytest.raises(KafkaError):
+            await _check_topic_policy(admin, "t", "compact", "reconcile")
+
+    @pytest.mark.parametrize("exc", [KafkaError("broker down"), asyncio.TimeoutError()])
+    async def test_describe_raises_warn_is_info_unreadable(
+        self, exc: Exception, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        admin = _FakeAdminClient(describe=exc)
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            result = await _check_topic_policy(admin, "t", "compact", "warn")
+        assert result == EnsureTopicResult("unreadable", None)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    async def test_describe_raises_raise_propagates(self) -> None:
+        admin = _FakeAdminClient(describe=KafkaError("broker down"))
+        with pytest.raises(KafkaError):
+            await _check_topic_policy(admin, "t", "compact", "raise")
+
+    async def test_non_kafka_error_propagates_even_under_warn(self) -> None:
+        # Guard against an over-broad except swallowing real bugs.
+        admin = _FakeAdminClient(describe=ValueError("boom"))
+        with pytest.raises(ValueError, match="boom"):
+            await _check_topic_policy(admin, "t", "compact", "warn")
+
+    async def test_absent_policy_warn_is_info_unreadable(self, caplog: pytest.LogCaptureFixture) -> None:
+        admin = _FakeAdminClient(describe=_describe_response([("retention.ms", "1000", False, 1, False, [])]))
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            result = await _check_topic_policy(admin, "t", "compact", "warn")
+        assert result == EnsureTopicResult("unreadable", None)
+        assert not any(r.levelno == logging.WARNING for r in caplog.records)
+
+    @pytest.mark.parametrize("action", ["raise", "reconcile"])
+    async def test_absent_policy_strict_modes_raise_runtimeerror(self, action: str) -> None:
+        admin = _FakeAdminClient(describe=_describe_response([("retention.ms", "1000", False, 1, False, [])]))
+        with pytest.raises(RuntimeError, match="could not read cleanup.policy"):
+            await _check_topic_policy(admin, "t", "compact", action)
+
+
+# ---------------------------------------------------------------------------
 # ensure_topic — validation, idempotency, error propagation (mocked admin)
 # ---------------------------------------------------------------------------
 #
@@ -513,22 +930,11 @@ async def test_barrier_accounts_for_decode_skipped_records(topic: str, table_fac
 # they're exercised against a fake admin client instead.
 
 
-class _FakeAdmin:
-    """Stand-in for AIOKafkaAdminClient: ``create_topics`` does whatever
-    ``on_create`` dictates, and ``close`` records that the ``finally`` ran."""
+def _install_admin(monkeypatch: pytest.MonkeyPatch, admin: _FakeAdminClient) -> None:
+    monkeypatch.setattr("ktables.kafka_table.AIOKafkaAdminClient", lambda **kw: admin)
 
-    def __init__(self, on_create) -> None:
-        self._on_create = on_create
-        self.closed = False
 
-    async def start(self) -> None:
-        pass
-
-    async def create_topics(self, topics) -> None:
-        self._on_create()
-
-    async def close(self) -> None:
-        self.closed = True
+_EXISTS = [("t", 36, "The topic has already been created")]
 
 
 class TestEnsureTopic:
@@ -539,24 +945,150 @@ class TestEnsureTopic:
         with pytest.raises(ValueError, match=">= 1"):
             await ensure_topic(BOOTSTRAP, "t", replication_factor=0)
 
-    async def test_already_exists_returns_false_and_closes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def already_exists() -> None:
-            raise TopicAlreadyExistsError()
+    async def test_created_returns_created_outcome_without_checking(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        admin = _FakeAdminClient(create=_create_response([("t", 0, "")]))
+        _install_admin(monkeypatch, admin)
+        result = await ensure_topic(BOOTSTRAP, "t")
+        assert result == EnsureTopicResult("created", None)
+        assert admin.describe_calls == 0  # nothing to check on a fresh create
+        assert admin.closed
 
-        admin = _FakeAdmin(already_exists)
-        monkeypatch.setattr("ktables.kafka_table.AIOKafkaAdminClient", lambda **kw: admin)
-        assert await ensure_topic(BOOTSTRAP, "t") is False
-        assert admin.closed  # finally: the client is always closed
+    async def test_ignore_mode_skips_without_describe(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        admin = _FakeAdminClient(create=_create_response(_EXISTS))
+        _install_admin(monkeypatch, admin)
+        result = await ensure_topic(BOOTSTRAP, "t", on_policy_mismatch="ignore")
+        assert result == EnsureTopicResult("skipped", None)
+        assert admin.describe_calls == 0
 
-    async def test_unexpected_error_is_reraised_and_closes(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def boom() -> None:
-            raise RuntimeError("create_topics failed")
+    async def test_non_compacting_declared_policy_skips_without_describe(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        admin = _FakeAdminClient(create=_create_response(_EXISTS))
+        _install_admin(monkeypatch, admin)
+        result = await ensure_topic(BOOTSTRAP, "t", topic_configs={"cleanup.policy": "delete"})
+        assert result == EnsureTopicResult("skipped", None)
+        assert admin.describe_calls == 0
 
-        admin = _FakeAdmin(boom)
-        monkeypatch.setattr("ktables.kafka_table.AIOKafkaAdminClient", lambda **kw: admin)
-        with pytest.raises(RuntimeError, match="create_topics failed"):
+    async def test_existing_compacting_topic_is_verified(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        admin = _FakeAdminClient(
+            create=_create_response(_EXISTS),
+            describe=_describe_response(_entries_with_policy("compact")),
+        )
+        _install_admin(monkeypatch, admin)
+        result = await ensure_topic(BOOTSTRAP, "t")
+        assert result == EnsureTopicResult("verified", "compact")
+
+    async def test_default_warn_on_mismatch_logs_one_warning_no_alter(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        admin = _FakeAdminClient(
+            create=_create_response(_EXISTS),
+            describe=_describe_response(_entries_with_policy("delete")),
+        )
+        _install_admin(monkeypatch, admin)
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            result = await ensure_topic(BOOTSTRAP, "t")  # default on_policy_mismatch="warn"
+        assert result == EnsureTopicResult("mismatch", "delete")
+        assert admin.alter_calls == 0
+        assert len([r for r in caplog.records if r.levelno == logging.WARNING]) == 1
+
+    async def test_reconcile_flips_and_returns_reconciled(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        admin = _FakeAdminClient(
+            create=_create_response(_EXISTS),
+            describe=_describe_response(_entries_with_policy("delete", {"retention.ms": "1234567"})),
+            alter=_alter_response(),
+        )
+        _install_admin(monkeypatch, admin)
+        result = await ensure_topic(BOOTSTRAP, "t", on_policy_mismatch="reconcile")
+        assert result == EnsureTopicResult("reconciled", "delete")
+        assert admin.altered_configs == {"cleanup.policy": "compact", "retention.ms": "1234567"}
+        assert admin.closed
+
+    async def test_start_failure_propagates_and_closes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Bug #2: start() is inside try/finally, so a failed connect still closes.
+        admin = _FakeAdminClient(start_exc=KafkaConnectionError("broker down"))
+        _install_admin(monkeypatch, admin)
+        with pytest.raises(KafkaConnectionError):
             await ensure_topic(BOOTSTRAP, "t")
-        assert admin.closed  # finally still runs on the re-raise path
+        assert admin.closed
+
+    async def test_raise_mode_mismatch_raises_and_closes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        admin = _FakeAdminClient(
+            create=_create_response(_EXISTS),
+            describe=_describe_response(_entries_with_policy("delete")),
+        )
+        _install_admin(monkeypatch, admin)
+        with pytest.raises(TopicConfigMismatchError):
+            await ensure_topic(BOOTSTRAP, "t", on_policy_mismatch="raise")
+        assert admin.closed  # finally still runs on the policy-assertion raise path
+
+    async def test_create_error_is_reraised_and_closes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        admin = _FakeAdminClient(create=_create_response([("t", 29, "Not authorized")]))
+        _install_admin(monkeypatch, admin)
+        with pytest.raises(TopicAuthorizationFailedError, match="Not authorized"):
+            await ensure_topic(BOOTSTRAP, "t")
+        assert admin.closed
+
+
+def _make_table(**kw):
+    return KafkaTable(bootstrap_servers="b", topic="t", value_decoder=bytes, **kw)
+
+
+def _make_writer(**kw):
+    return KafkaTableWriter(bootstrap_servers="b", topic="t", value_encoder=bytes, **kw)
+
+
+class TestOnPolicyMismatchValidation:
+    @pytest.mark.parametrize("make", [_make_table, _make_writer])
+    def test_rejects_unknown_action(self, make) -> None:
+        with pytest.raises(ValueError, match="on_policy_mismatch"):
+            make(on_policy_mismatch="bogus")
+
+    @pytest.mark.parametrize("make", [_make_table, _make_writer])
+    @pytest.mark.parametrize("action", ["raise", "reconcile"])
+    def test_active_action_with_ensure_topic_false_raises(self, make, action: str) -> None:
+        with pytest.raises(ValueError, match="ensure_topic=True"):
+            make(ensure_topic=False, on_policy_mismatch=action)
+
+    @pytest.mark.parametrize("make", [_make_table, _make_writer])
+    @pytest.mark.parametrize("action", ["ignore", "warn"])
+    def test_passive_action_with_ensure_topic_false_is_allowed(self, make, action: str) -> None:
+        make(ensure_topic=False, on_policy_mismatch=action)  # constructs cleanly, no raise
+
+
+class TestStartForwardsOnPolicyMismatch:
+    """start() must thread on_policy_mismatch into ensure_topic — otherwise the
+    whole table/writer surface silently degrades to the default. A sentinel raised
+    by the patched ensure_topic aborts start() before it touches a broker."""
+
+    class _Sentinel(Exception):
+        pass
+
+    async def test_kafka_table_start_forwards(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict = {}
+
+        async def fake_ensure(*args, **kwargs):
+            captured.update(kwargs)
+            raise self._Sentinel()
+
+        monkeypatch.setattr("ktables.kafka_table.ensure_topic", fake_ensure)
+        table = _make_table(on_policy_mismatch="raise")
+        with pytest.raises(self._Sentinel):
+            await table.start()
+        assert captured["on_policy_mismatch"] == "raise"
+
+    async def test_kafka_table_writer_start_forwards(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict = {}
+
+        async def fake_ensure(*args, **kwargs):
+            captured.update(kwargs)
+            raise self._Sentinel()
+
+        monkeypatch.setattr("ktables.kafka_table.ensure_topic", fake_ensure)
+        writer = _make_writer(on_policy_mismatch="reconcile")
+        with pytest.raises(self._Sentinel):
+            await writer.start()
+        assert captured["on_policy_mismatch"] == "reconcile"
 
 
 # ---------------------------------------------------------------------------
@@ -932,3 +1464,98 @@ async def test_raising_on_set_hook_kills_the_reader(topic: str, table_factory, w
         await writer.set("k", make_record("k", 1))
         assert await eventually(lambda: table.status == "failed")
         assert isinstance(table.failure, RuntimeError)
+
+
+# ---------------------------------------------------------------------------
+# on_policy_mismatch — integration (real Redpanda: pre-create, then reconcile)
+# ---------------------------------------------------------------------------
+
+
+async def _precreate_topic(bootstrap: str, topic: str, policy: str, **extra: str) -> None:
+    admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap)
+    await admin.start()
+    try:
+        await admin.create_topics(
+            [
+                NewTopic(
+                    name=topic,
+                    num_partitions=1,
+                    replication_factor=1,
+                    topic_configs={"cleanup.policy": policy, **extra},
+                )
+            ]
+        )
+    finally:
+        await admin.close()
+
+
+async def _read_config(bootstrap: str, topic: str, key: str) -> str | None:
+    admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap)
+    await admin.start()
+    try:
+        resps = await admin.describe_configs([ConfigResource(ConfigResourceType.TOPIC, topic)])
+        for r in resps:
+            for res in r.resources:
+                for entry in res[4]:
+                    if entry[0] == key:
+                        return entry[1]
+    finally:
+        await admin.close()
+    return None
+
+
+class TestOnPolicyMismatchIntegration:
+    async def test_reconcile_flips_delete_to_compact_preserving_overrides(self, bootstrap, topic) -> None:
+        await _precreate_topic(bootstrap, topic, "delete", **{"retention.ms": "1234567", "segment.bytes": "10485760"})
+        result = await ensure_topic(bootstrap, topic, on_policy_mismatch="reconcile")
+        assert result == EnsureTopicResult("reconciled", "delete")
+        assert "compact" in _split_policy(await _read_config(bootstrap, topic, "cleanup.policy"))
+        assert await _read_config(bootstrap, topic, "retention.ms") == "1234567"
+        assert await _read_config(bootstrap, topic, "segment.bytes") == "10485760"
+
+    async def test_reconcile_is_idempotent(self, bootstrap, topic) -> None:
+        await _precreate_topic(bootstrap, topic, "delete")
+        first = await ensure_topic(bootstrap, topic, on_policy_mismatch="reconcile")
+        assert first.outcome == "reconciled"
+        # Already compacting now: a second run verifies and does NOT alter again.
+        second = await ensure_topic(bootstrap, topic, on_policy_mismatch="reconcile")
+        assert second.outcome == "verified"
+        assert "compact" in _split_policy(second.policy)
+
+    async def test_compact_delete_accepted_by_all_active_modes(self, bootstrap, topic) -> None:
+        await _precreate_topic(bootstrap, topic, "compact,delete")
+        # Pin the broker's literal returned policy string against the set-split logic.
+        assert _split_policy(await _read_config(bootstrap, topic, "cleanup.policy")) == {"compact", "delete"}
+        for mode in ("warn", "raise", "reconcile"):
+            result = await ensure_topic(bootstrap, topic, on_policy_mismatch=mode)
+            assert result.outcome == "verified"
+            assert "compact" in _split_policy(result.policy)
+
+    async def test_existing_delete_raise_mode_raises(self, bootstrap, topic) -> None:
+        await _precreate_topic(bootstrap, topic, "delete")
+        with pytest.raises(TopicConfigMismatchError):
+            await ensure_topic(bootstrap, topic, on_policy_mismatch="raise")
+
+    async def test_table_and_writer_start_raise_on_mismatch(self, bootstrap, topic) -> None:
+        await _precreate_topic(bootstrap, topic, "delete")
+        table = KafkaTable(bootstrap_servers=bootstrap, topic=topic, value_decoder=bytes, on_policy_mismatch="raise")
+        with pytest.raises(TopicConfigMismatchError):
+            await table.start()
+        writer = KafkaTableWriter(bootstrap_servers=bootstrap, topic=topic, value_encoder=bytes, on_policy_mismatch="raise")
+        with pytest.raises(TopicConfigMismatchError):
+            await writer.start()
+
+    async def test_table_starts_under_warn_despite_mismatch(self, bootstrap, topic) -> None:
+        await _precreate_topic(bootstrap, topic, "delete")
+        table = KafkaTable(bootstrap_servers=bootstrap, topic=topic, value_decoder=bytes, on_policy_mismatch="warn")
+        async with table:  # start() runs real ensure_topic returning EnsureTopicResult, then connects
+            assert table.status == "caught_up"
+
+    async def test_concurrent_reader_and_writer_reconcile_converges(self, bootstrap, topic) -> None:
+        await _precreate_topic(bootstrap, topic, "delete", **{"retention.ms": "1234567"})
+        table = KafkaTable(bootstrap_servers=bootstrap, topic=topic, value_decoder=bytes, on_policy_mismatch="reconcile")
+        writer = KafkaTableWriter(bootstrap_servers=bootstrap, topic=topic, value_encoder=bytes, on_policy_mismatch="reconcile")
+        async with table, writer:
+            pass
+        assert "compact" in _split_policy(await _read_config(bootstrap, topic, "cleanup.policy"))
+        assert await _read_config(bootstrap, topic, "retention.ms") == "1234567"
