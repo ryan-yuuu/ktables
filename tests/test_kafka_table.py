@@ -30,6 +30,7 @@ from aiokafka.errors import (
     KafkaError,
     TopicAlreadyExistsError,
     TopicAuthorizationFailedError,
+    UnknownTopicOrPartitionError,
 )
 from pydantic import AwareDatetime, BaseModel
 
@@ -767,6 +768,11 @@ class TestTryCreateTopic:
         admin = _FakeAdminClient(create=TopicAlreadyExistsError())
         assert await _try_create_topic(admin, "t", 1, 1, {"cleanup.policy": "compact"}) is False
 
+    async def test_empty_topic_errors_raises_unconfirmed(self) -> None:
+        admin = _FakeAdminClient(create=_create_response([]))
+        with pytest.raises(RuntimeError, match="cannot confirm"):
+            await _try_create_topic(admin, "t", 1, 1, {"cleanup.policy": "compact"})
+
 
 class TestPolicyFromEntries:
     def test_returns_cleanup_policy_value(self) -> None:
@@ -802,14 +808,29 @@ class TestReconcilePolicy:
         assert len(msgs) == 1
         assert "preserved 2 override" in msgs[0]
 
+    @pytest.mark.parametrize(
+        "code,exc",
+        [
+            (29, TopicAuthorizationFailedError),  # ACL denial
+            (3, UnknownTopicOrPartitionError),  # topic vanished mid-flight
+            (40, InvalidConfigurationError),  # §5.4: a preserved override rejected on write
+        ],
+    )
     async def test_inband_alter_rejection_raises_and_does_not_log_success(
-        self, caplog: pytest.LogCaptureFixture
+        self, code: int, exc: type[Exception], caplog: pytest.LogCaptureFixture
     ) -> None:
-        admin = _FakeAdminClient(alter=_alter_response(code=29, msg="Not authorized"))
+        admin = _FakeAdminClient(alter=_alter_response(code=code, msg="rejected"))
         with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
-            with pytest.raises(TopicAuthorizationFailedError, match="Not authorized"):
+            with pytest.raises(exc, match="rejected"):
                 await _reconcile_policy(admin, "t", "compact", _OVERRIDE_ENTRIES)
         assert not any("reconciled topic" in r.message for r in caplog.records)
+
+    async def test_empty_alter_response_raises_unconfirmed(self) -> None:
+        # A degenerate broker that echoes no resource must not be reported as success.
+        admin = _FakeAdminClient(alter=[types.SimpleNamespace(resources=[])])
+        with pytest.raises(RuntimeError, match="cannot confirm reconcile"):
+            await _reconcile_policy(admin, "t", "compact", _OVERRIDE_ENTRIES)
+        assert admin.alter_calls == 1
 
 
 class TestCheckTopicPolicyVerifiedAndMismatch:
@@ -862,6 +883,22 @@ class TestCheckTopicPolicyVerifiedAndMismatch:
         assert admin.alter_calls == 1
         assert admin.altered_configs == {"cleanup.policy": "compact", "retention.ms": "1234567"}
 
+    async def test_reconcile_to_plain_compact_logs_no_retention_caveat(self, caplog: pytest.LogCaptureFixture) -> None:
+        admin = _FakeAdminClient(describe=_describe_response(_entries_with_policy("delete")), alter=_alter_response())
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            await _check_topic_policy(admin, "t", "compact", "reconcile")
+        assert not any("retention" in r.message for r in caplog.records)
+
+    async def test_reconcile_to_compact_delete_logs_retention_caveat(self, caplog: pytest.LogCaptureFixture) -> None:
+        # §5.3: the eviction caveat fires on the effective post-action policy too.
+        admin = _FakeAdminClient(describe=_describe_response(_entries_with_policy("delete")), alter=_alter_response())
+        with caplog.at_level(logging.INFO, logger="ktables.kafka_table"):
+            result = await _check_topic_policy(admin, "t", "compact,delete", "reconcile")
+        assert result.outcome == "reconciled"
+        assert admin.altered_configs["cleanup.policy"] == "compact,delete"
+        retention = [r for r in caplog.records if "retention" in r.message]
+        assert len(retention) == 1 and retention[0].levelno == logging.INFO
+
 
 class TestCheckTopicPolicyUnverifiable:
     @pytest.mark.parametrize("code", [29, 3])
@@ -882,8 +919,16 @@ class TestCheckTopicPolicyUnverifiable:
 
     async def test_inband_describe_error_reconcile_propagates(self) -> None:
         admin = _FakeAdminClient(describe=_describe_response([], code=3, msg="missing"))
-        with pytest.raises(KafkaError):
+        with pytest.raises(UnknownTopicOrPartitionError, match="missing"):
             await _check_topic_policy(admin, "t", "compact", "reconcile")
+
+    async def test_flat_list_describe_response_fails_loudly(self) -> None:
+        # A mock returning a bare list of tuples (no .resources wrapper) must FAIL —
+        # pinning that the list[Response] -> .resources indirection is load-bearing,
+        # so a "simplified" mock can't pass while diverging from the real broker.
+        admin = _FakeAdminClient(describe=[(0, "", 2, "t", _entries_with_policy("compact"))])
+        with pytest.raises(AttributeError):
+            await _check_topic_policy(admin, "t", "compact", "warn")
 
     @pytest.mark.parametrize("exc", [KafkaError("broker down"), asyncio.TimeoutError()])
     async def test_describe_raises_warn_is_info_unreadable(
@@ -919,6 +964,14 @@ class TestCheckTopicPolicyUnverifiable:
         with pytest.raises(RuntimeError, match="could not read cleanup.policy"):
             await _check_topic_policy(admin, "t", "compact", action)
 
+    async def test_unknown_action_raises_and_does_not_reconcile(self) -> None:
+        # Defense in depth: an action that somehow reached the dispatch must NOT
+        # silently fall through to a broker mutation.
+        admin = _FakeAdminClient(describe=_describe_response(_entries_with_policy("delete")), alter=_alter_response())
+        with pytest.raises(ValueError, match="unexpected on_policy_mismatch"):
+            await _check_topic_policy(admin, "t", "compact", "bogus")
+        assert admin.alter_calls == 0
+
 
 # ---------------------------------------------------------------------------
 # ensure_topic — validation, idempotency, error propagation (mocked admin)
@@ -944,6 +997,12 @@ class TestEnsureTopic:
             await ensure_topic(BOOTSTRAP, "t", num_partitions=0)
         with pytest.raises(ValueError, match=">= 1"):
             await ensure_topic(BOOTSTRAP, "t", replication_factor=0)
+
+    async def test_rejects_unknown_on_policy_mismatch_before_connecting(self) -> None:
+        # The standalone primitive must fail fast on a typo — never fall through
+        # to a broker mutation. Validation precedes any admin client.
+        with pytest.raises(ValueError, match="on_policy_mismatch"):
+            await ensure_topic(BOOTSTRAP, "t", on_policy_mismatch="bogus")
 
     async def test_created_returns_created_outcome_without_checking(self, monkeypatch: pytest.MonkeyPatch) -> None:
         admin = _FakeAdminClient(create=_create_response([("t", 0, "")]))
@@ -1089,6 +1148,22 @@ class TestStartForwardsOnPolicyMismatch:
         with pytest.raises(self._Sentinel):
             await writer.start()
         assert captured["on_policy_mismatch"] == "reconcile"
+
+    async def test_start_tolerates_ensure_topic_result_return(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # start() must DISCARD ensure_topic's EnsureTopicResult, not branch on it.
+        # ensure_topic returns the new type; the consumer ctor then aborts via the
+        # sentinel — reaching it proves start() accepted the return and proceeded.
+        async def fake_ensure(*args, **kwargs):
+            return EnsureTopicResult("mismatch", "delete")
+
+        def boom_consumer(*args, **kwargs):
+            raise self._Sentinel()
+
+        monkeypatch.setattr("ktables.kafka_table.ensure_topic", fake_ensure)
+        monkeypatch.setattr("ktables.kafka_table.AIOKafkaConsumer", boom_consumer)
+        table = _make_table(on_policy_mismatch="warn")
+        with pytest.raises(self._Sentinel):
+            await table.start()
 
 
 # ---------------------------------------------------------------------------
@@ -1545,11 +1620,17 @@ class TestOnPolicyMismatchIntegration:
         with pytest.raises(TopicConfigMismatchError):
             await writer.start()
 
-    async def test_table_starts_under_warn_despite_mismatch(self, bootstrap, topic) -> None:
+    async def test_table_starts_under_warn_despite_mismatch(
+        self, bootstrap, topic, caplog: pytest.LogCaptureFixture
+    ) -> None:
         await _precreate_topic(bootstrap, topic, "delete")
         table = KafkaTable(bootstrap_servers=bootstrap, topic=topic, value_decoder=bytes, on_policy_mismatch="warn")
-        async with table:  # start() runs real ensure_topic returning EnsureTopicResult, then connects
-            assert table.status == "caught_up"
+        with caplog.at_level(logging.WARNING, logger="ktables.kafka_table"):
+            async with table:  # start() runs real ensure_topic, logs WARNING, then connects
+                assert table.status == "caught_up"
+        # warn (not ignore): the mismatch must have produced exactly one WARNING.
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING and topic in r.message]
+        assert len(warnings) == 1
 
     async def test_concurrent_reader_and_writer_reconcile_converges(self, bootstrap, topic) -> None:
         await _precreate_topic(bootstrap, topic, "delete", **{"retention.ms": "1234567"})

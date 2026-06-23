@@ -124,6 +124,21 @@ def _satisfies_compaction(actual: str) -> bool:
     return "compact" in _split_policy(actual)
 
 
+def _log_retention_caveat(topic: str, effective_policy: str) -> None:
+    """Note (once) that a ``compact,delete`` policy still evicts via retention.
+
+    Fired on the effective post-action policy — both when an existing topic is
+    ``compact,delete`` (verified) and when a reconcile targets it.
+    """
+    if "delete" in _split_policy(effective_policy):
+        logger.info(
+            "topic %s uses cleanup.policy=%r; retention-based eviction still applies — "
+            "un-refreshed keys may be evicted",
+            topic,
+            effective_policy,
+        )
+
+
 def _explicit_overrides(config_entries: object) -> dict[str, str]:
     """Extract the writable, explicitly-set topic overrides from a describe entry list.
 
@@ -171,6 +186,20 @@ def _raise_for_code(code: int, message: str | None) -> None:
         raise for_code(code)(message or "")
 
 
+def _raise_on_inband_errors(responses: object) -> None:
+    """Raise on the first non-zero per-resource ``error_code`` across a
+    ``describe_configs``/``alter_configs`` response list.
+
+    Both methods return ``list[Response]`` whose ``.resources`` elements put
+    ``error_code``/``error_message`` at indices 0/1. (``create_topics`` uses a
+    different shape — ``topic_errors`` with the code at index 1 — and is parsed
+    separately in ``_try_create_topic``.)
+    """
+    for response in responses:  # type: ignore[attr-defined]
+        for resource in response.resources:
+            _raise_for_code(resource[0], resource[1])
+
+
 async def _try_create_topic(
     admin: AIOKafkaAdminClient,
     topic: str,
@@ -199,6 +228,8 @@ async def _try_create_topic(
         )
     except TopicAlreadyExistsError:
         return False
+    if not resp.topic_errors:
+        raise RuntimeError(f"create_topics for topic {topic!r} returned no result; cannot confirm")
     for entry in resp.topic_errors:
         code = entry[1]
         message = entry[2] if len(entry) > 2 else ""
@@ -227,9 +258,9 @@ async def _reconcile_policy(
     merged = _explicit_overrides(config_entries)
     merged["cleanup.policy"] = expected
     responses = await admin.alter_configs([ConfigResource(ConfigResourceType.TOPIC, topic, configs=merged)])
-    for response in responses:
-        for resource in response.resources:
-            _raise_for_code(resource[0], resource[1])
+    _raise_on_inband_errors(responses)
+    if not any(response.resources for response in responses):
+        raise RuntimeError(f"alter_configs for topic {topic!r} returned no result; cannot confirm reconcile")
     preserved = sorted(set(merged) - {"cleanup.policy"})
     logger.info(
         "reconciled topic %s cleanup.policy -> %s; preserved %d override(s): %s",
@@ -259,11 +290,8 @@ async def _check_topic_policy(
     # barrier()), so a real bug still surfaces.
     try:
         responses = await admin.describe_configs([ConfigResource(ConfigResourceType.TOPIC, topic)])
-        entries: object = []
-        for response in responses:
-            for resource in response.resources:
-                _raise_for_code(resource[0], resource[1])
-                entries = resource[4]
+        _raise_on_inband_errors(responses)
+        entries: object = next((res[4] for response in responses for res in response.resources), [])
         policy = _policy_from_entries(entries)
     except (KafkaError, asyncio.TimeoutError):
         if action == "warn":
@@ -277,13 +305,7 @@ async def _check_topic_policy(
             return EnsureTopicResult("unreadable", None)
         raise RuntimeError(f"could not read cleanup.policy for topic {topic!r}")
     if _satisfies_compaction(policy):
-        if "delete" in _split_policy(policy):
-            logger.info(
-                "topic %s uses cleanup.policy=%r; retention-based eviction still applies — "
-                "un-refreshed keys may be evicted",
-                topic,
-                policy,
-            )
+        _log_retention_caveat(topic, policy)
         return EnsureTopicResult("verified", policy)
     # Confirmed mismatch: the existing policy does not compact.
     if action == "warn":
@@ -300,8 +322,11 @@ async def _check_topic_policy(
         return EnsureTopicResult("mismatch", policy)
     if action == "raise":
         raise TopicConfigMismatchError(topic, expected, policy)
-    await _reconcile_policy(admin, topic, expected, entries)
-    return EnsureTopicResult("reconciled", policy)
+    if action == "reconcile":
+        await _reconcile_policy(admin, topic, expected, entries)
+        _log_retention_caveat(topic, expected)  # §5.3: a compact,delete target still evicts
+        return EnsureTopicResult("reconciled", policy)
+    raise ValueError(f"unexpected on_policy_mismatch action: {action!r}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -390,6 +415,9 @@ async def ensure_topic(
     """
     if num_partitions < 1 or replication_factor < 1:
         raise ValueError(f"num_partitions and replication_factor must be >= 1, got {num_partitions}/{replication_factor}")
+    # ensure_topic always creates, so the inert-combo arm is moot here; this rejects
+    # an unknown value before any admin call, so a typo can't fall through to reconcile.
+    _validate_policy_mismatch(on_policy_mismatch, ensure_topic=True)
     effective = topic_configs if topic_configs is not None else DEFAULT_TOPIC_CONFIGS
     expected = effective.get("cleanup.policy")
     admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap_servers)
