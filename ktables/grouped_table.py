@@ -29,7 +29,14 @@ if TYPE_CHECKING:
     # dependency on 3.10. Mirrors kafka_table.py.
     from typing_extensions import Self
 
-from ktables.kafka_table import KafkaTable, KafkaTableWriter, SupportsJsonModel, TableStatus, ViewStats
+from ktables.kafka_table import (
+    KafkaTable,
+    KafkaTableWriter,
+    PolicyMismatchAction,
+    SupportsJsonModel,
+    TableStatus,
+    ViewStats,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +117,9 @@ class GroupedKafkaTable(Generic[V]):
     Reads are synchronous and return point-in-time copies (value objects shared
     by reference), exactly like ``KafkaTable``. Not thread-safe; single event
     loop only. Reads before ``start()`` raise. See README.md for usage.
+
+    ``on_policy_mismatch`` forwards to the inner table unchanged — see
+    :class:`~ktables.kafka_table.KafkaTable`.
     """
 
     def __init__(
@@ -124,6 +134,7 @@ class GroupedKafkaTable(Generic[V]):
         fetch_max_wait_ms: int = 500,
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
+        on_policy_mismatch: PolicyMismatchAction = "warn",
     ) -> None:
         self._codec = key_codec
         self._index: dict[str, dict[str, V]] = {}
@@ -139,6 +150,7 @@ class GroupedKafkaTable(Generic[V]):
             fetch_max_wait_ms=fetch_max_wait_ms,
             ensure_topic=ensure_topic,
             topic_configs=topic_configs,
+            on_policy_mismatch=on_policy_mismatch,
             on_set=self._index_set,
             on_delete=self._index_delete,
         )
@@ -312,6 +324,9 @@ class GroupedKafkaTableWriter(Generic[V]):
     ``(group, member)`` is a distinct key, independent writers never share a key:
     no read-modify-write, no lost update. Registry-grade durability
     (``enable_idempotence`` implies ``acks=all``) and lifecycle are the inner writer's.
+
+    ``on_policy_mismatch`` forwards to the inner writer unchanged — see
+    :class:`~ktables.kafka_table.KafkaTable`.
     """
 
     def __init__(
@@ -323,6 +338,7 @@ class GroupedKafkaTableWriter(Generic[V]):
         key_codec: CompositeKeyCodec = DEFAULT_KEY_CODEC,
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
+        on_policy_mismatch: PolicyMismatchAction = "warn",
         enable_idempotence: bool = True,
     ) -> None:
         self._codec = key_codec
@@ -335,6 +351,7 @@ class GroupedKafkaTableWriter(Generic[V]):
             value_encoder=value_encoder,
             ensure_topic=ensure_topic,
             topic_configs=topic_configs,
+            on_policy_mismatch=on_policy_mismatch,
             enable_idempotence=enable_idempotence,
         )
 

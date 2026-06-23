@@ -53,7 +53,8 @@ if TYPE_CHECKING:
 
 from aiokafka import AIOKafkaConsumer, AIOKafkaProducer, ConsumerRecord, TopicPartition
 from aiokafka.admin import AIOKafkaAdminClient, NewTopic
-from aiokafka.errors import IllegalStateError, KafkaError, TopicAlreadyExistsError
+from aiokafka.admin.config_resource import ConfigResource, ConfigResourceType
+from aiokafka.errors import IllegalStateError, KafkaError, TopicAlreadyExistsError, for_code
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,21 @@ DEFAULT_TOPIC_CONFIGS: Mapping[str, str] = MappingProxyType({"cleanup.policy": "
 TableStatus = Literal["unstarted", "loading", "caught_up", "degraded", "failed"]
 """``degraded``: catch-up timed out; serving possibly-partial data (loudly logged).
 ``failed``: the reader task died; contents are frozen at the last applied state."""
+
+PolicyMismatchAction = Literal["ignore", "warn", "raise", "reconcile"]
+"""What to do when an EXISTING topic's cleanup.policy isn't compacting:
+``ignore`` (no describe call — intended pre-feature behavior), ``warn`` (default:
+describe, log loudly on a confirmed mismatch, change nothing), ``raise``
+(:class:`TopicConfigMismatchError`), ``reconcile`` (safely flip to compact,
+preserving other configs)."""
+
+EnsureTopicOutcome = Literal["created", "verified", "reconciled", "mismatch", "unreadable", "skipped"]
+"""What :func:`ensure_topic` did, when the topic ALREADY existed unless ``created``:
+``created`` (this call made it, compacted), ``verified`` (existed & compacting),
+``reconciled`` (existed non-compacting, flipped to compact), ``mismatch`` (existed
+non-compacting, left as-is under ``warn``), ``unreadable`` (existed, policy could
+not be read under ``warn``), ``skipped`` (existed, not checked — ``ignore`` mode or
+the declared policy needs no compaction)."""
 
 
 class SupportsJsonModel(Protocol):
@@ -78,6 +94,297 @@ class SupportsJsonModel(Protocol):
 JsonT = TypeVar("JsonT", bound=SupportsJsonModel)
 
 
+def _split_policy(policy: str) -> set[str]:
+    """Parse a ``cleanup.policy`` value into its set of components.
+
+    Kafka allows the combined ``compact,delete`` policy, and a broker may return
+    it reordered or with whitespace (``"delete, compact"``); splitting into a
+    whitespace-stripped set makes membership tests order- and spacing-insensitive.
+    """
+    return {p.strip() for p in policy.split(",")}
+
+
+def _requires_compaction(expected: str | None) -> bool:
+    """Whether the caller's declared ``cleanup.policy`` asks for compaction.
+
+    ``None`` means no policy was declared (so there is nothing to enforce). A
+    declared non-compacting policy (e.g. ``delete``) is the caller's explicit
+    choice and is likewise not enforced.
+    """
+    return expected is not None and "compact" in _split_policy(expected)
+
+
+def _satisfies_compaction(actual: str) -> bool:
+    """Whether an existing topic's effective ``cleanup.policy`` compacts.
+
+    ``compact,delete`` satisfies this (it compacts) even though its ``delete``
+    component still applies retention-based eviction — see the spec's
+    ``compact,delete`` boundary.
+    """
+    return "compact" in _split_policy(actual)
+
+
+def _log_retention_caveat(topic: str, effective_policy: str) -> None:
+    """Note (once) that a ``compact,delete`` policy still evicts via retention.
+
+    Fired on the effective post-action policy — both when an existing topic is
+    ``compact,delete`` (verified) and when a reconcile targets it.
+    """
+    if "delete" in _split_policy(effective_policy):
+        logger.info(
+            "topic %s uses cleanup.policy=%r; retention-based eviction still applies — "
+            "un-refreshed keys may be evicted",
+            topic,
+            effective_policy,
+        )
+
+
+def _explicit_overrides(config_entries: object) -> dict[str, str]:
+    """Extract the writable, explicitly-set topic overrides from a describe entry list.
+
+    A full-replace ``alter_configs`` must resubmit exactly these (and nothing
+    read-only or broker-defaulted, which the broker would reject or reset), so the
+    reconcile can flip ``cleanup.policy`` without clobbering operator tuning.
+
+    Handles both ``DescribeConfigsResponse`` shapes by inspecting field index 3:
+    a ``bool`` is the v0 ``is_default`` flag (keep when not default); an ``int`` is
+    the v1+ ``config_source`` (keep when ``TOPIC_CONFIG`` == 1). Modern brokers
+    speak v1+, so the v0 arm is defensive.
+    """
+    out: dict[str, str] = {}
+    for entry in config_entries:  # type: ignore[attr-defined]
+        name, value, read_only, source_or_default = entry[0], entry[1], entry[2], entry[3]
+        if read_only or value is None:
+            continue
+        is_override = (not source_or_default) if isinstance(source_or_default, bool) else (source_or_default == 1)
+        if is_override:
+            out[name] = value
+    return out
+
+
+def _policy_from_entries(config_entries: object) -> str | None:
+    """The effective ``cleanup.policy`` value among describe entries, or ``None``
+    if absent (an empty entry list or a topic that reported no policy)."""
+    for entry in config_entries:  # type: ignore[attr-defined]
+        if entry[0] == "cleanup.policy":
+            return entry[1]
+    return None
+
+
+def _raise_for_code(code: int, message: str | None) -> None:
+    """Convert a non-zero broker per-resource ``error_code`` into a raised aiokafka
+    exception, preserving the broker's ``error_message``.
+
+    ``create_topics``/``describe_configs``/``alter_configs`` report broker-side
+    rejection IN-BAND (a per-resource code), not by raising — so the code must be
+    inspected explicitly. ``for_code(0)`` is ``NoError`` (itself raisable), hence
+    the ``code != 0`` guard. ``message or ""`` keeps a ``None`` broker message from
+    rendering as the string ``"None"``.
+    """
+    if code != 0:
+        logger.debug("broker error_code=%d: %s", code, message)
+        raise for_code(code)(message or "")
+
+
+def _raise_on_inband_errors(responses: object) -> None:
+    """Raise on the first non-zero per-resource ``error_code`` across a
+    ``describe_configs``/``alter_configs`` response list.
+
+    Both methods return ``list[Response]`` whose ``.resources`` elements put
+    ``error_code``/``error_message`` at indices 0/1. (``create_topics`` uses a
+    different shape — ``topic_errors`` with the code at index 1 — and is parsed
+    separately in ``_try_create_topic``.)
+    """
+    for response in responses:  # type: ignore[attr-defined]
+        for resource in response.resources:
+            _raise_for_code(resource[0], resource[1])
+
+
+async def _try_create_topic(
+    admin: AIOKafkaAdminClient,
+    topic: str,
+    num_partitions: int,
+    replication_factor: int,
+    configs: dict[str, str],
+) -> bool:
+    """Create ``topic``; return True if this call created it, False if it existed.
+
+    Inspects the IN-BAND ``CreateTopicsResponse.topic_errors`` rather than relying
+    on ``TopicAlreadyExistsError`` — a real broker returns ``error_code=36`` in the
+    response and never raises (verified on aiokafka 0.13.0/0.14.0). Each
+    ``topic_errors`` element is ``(name, code[, message])`` (the v0 shape omits the
+    message). The defensive ``except`` covers any broker/version that *does* raise.
+    """
+    try:
+        resp = await admin.create_topics(
+            [
+                NewTopic(
+                    name=topic,
+                    num_partitions=num_partitions,
+                    replication_factor=replication_factor,
+                    topic_configs=configs,
+                )
+            ]
+        )
+    except TopicAlreadyExistsError:
+        return False
+    if not resp.topic_errors:
+        raise RuntimeError(f"create_topics for topic {topic!r} returned no result; cannot confirm")
+    for entry in resp.topic_errors:
+        code = entry[1]
+        message = entry[2] if len(entry) > 2 else ""
+        if code == 36:  # TOPIC_ALREADY_EXISTS
+            return False
+        _raise_for_code(code, message)
+    logger.info("created topic %s (partitions=%d, rf=%d)", topic, num_partitions, replication_factor)
+    return True
+
+
+async def _reconcile_policy(
+    admin: AIOKafkaAdminClient,
+    topic: str,
+    expected: str,
+    config_entries: object,
+) -> None:
+    """Flip an existing topic's ``cleanup.policy`` to ``expected`` without clobbering
+    operator tuning, via describe-then-merge.
+
+    aiokafka only exposes the full-replace ``alter_configs`` (no
+    ``incremental_alter_configs``), which resets any omitted config to its broker
+    default. So the existing explicit overrides are resubmitted alongside the new
+    policy. Broker rejection is in-band, so the response is inspected and a non-zero
+    code is raised BEFORE the success line — a denied alter must never log success.
+    """
+    merged = _explicit_overrides(config_entries)
+    merged["cleanup.policy"] = expected
+    responses = await admin.alter_configs([ConfigResource(ConfigResourceType.TOPIC, topic, configs=merged)])
+    _raise_on_inband_errors(responses)
+    if not any(response.resources for response in responses):
+        raise RuntimeError(f"alter_configs for topic {topic!r} returned no result; cannot confirm reconcile")
+    preserved = sorted(set(merged) - {"cleanup.policy"})
+    logger.info(
+        "reconciled topic %s cleanup.policy -> %s; preserved %d override(s): %s",
+        topic,
+        expected,
+        len(preserved),
+        preserved,
+    )
+
+
+async def _check_topic_policy(
+    admin: AIOKafkaAdminClient,
+    topic: str,
+    expected: str,
+    action: str,
+) -> "EnsureTopicResult":
+    """Inspect an existing topic's ``cleanup.policy`` and act per ``action``.
+
+    Returns ``verified``/``reconciled``/``mismatch`` (and dispatches the
+    ``warn``/``raise``/``reconcile`` behavior). The ``ignore`` action and the
+    not-required-compaction case never reach here (handled by the caller).
+    """
+    # The describe (and its in-band error_code, surfaced via _raise_for_code as a
+    # KafkaError) is the only I/O that can fail here. Under `warn` a verification
+    # failure is advisory — log at INFO and proceed; strict modes propagate. Catch
+    # only the expected broker/timeout types, never bare Exception (mirrors
+    # barrier()), so a real bug still surfaces.
+    try:
+        responses = await admin.describe_configs([ConfigResource(ConfigResourceType.TOPIC, topic)])
+        _raise_on_inband_errors(responses)
+        entries: object = next((res[4] for response in responses for res in response.resources), [])
+        policy = _policy_from_entries(entries)
+    except (KafkaError, asyncio.TimeoutError):
+        if action == "warn":
+            logger.info("could not verify cleanup.policy for topic %s (describe failed); proceeding", topic)
+            return EnsureTopicResult("unreadable", None)
+        raise
+    if policy is None:
+        # describe succeeded but reported no cleanup.policy (empty/absent).
+        if action == "warn":
+            logger.info("could not read cleanup.policy for topic %s (absent from describe); proceeding", topic)
+            return EnsureTopicResult("unreadable", None)
+        raise RuntimeError(f"could not read cleanup.policy for topic {topic!r}")
+    if _satisfies_compaction(policy):
+        _log_retention_caveat(topic, policy)
+        return EnsureTopicResult("verified", policy)
+    # Confirmed mismatch: the existing policy does not compact.
+    if action == "warn":
+        logger.warning(
+            "topic %r already exists with cleanup.policy=%r, which does not satisfy the required %r. "
+            "Keys not re-written within the topic's retention window will be EVICTED, so a fresh "
+            "consumer may materialize a table missing entries. Fix the topic's cleanup.policy to %r, "
+            "or construct with on_policy_mismatch='reconcile' (or 'raise' to fail fast).",
+            topic,
+            policy,
+            expected,
+            expected,
+        )
+        return EnsureTopicResult("mismatch", policy)
+    if action == "raise":
+        raise TopicConfigMismatchError(topic, expected, policy)
+    if action == "reconcile":
+        await _reconcile_policy(admin, topic, expected, entries)
+        _log_retention_caveat(topic, expected)  # §5.3: a compact,delete target still evicts
+        return EnsureTopicResult("reconciled", policy)
+    raise ValueError(f"unexpected on_policy_mismatch action: {action!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class EnsureTopicResult:
+    """The outcome of :func:`ensure_topic`.
+
+    A single discriminated ``outcome`` plus the ``policy`` that was read. ``policy``
+    is the existing topic's ``cleanup.policy`` for ``verified``/``reconciled``/
+    ``mismatch`` (for ``reconciled`` it is the PRE-reconcile value, e.g. ``delete``),
+    and ``None`` for ``created``/``skipped``/``unreadable`` (nothing was read). A
+    ``compact,delete`` topic surfaces as ``outcome='verified', policy='compact,delete'``.
+
+    A plain frozen carrier (like :class:`ViewStats`): ktables is the only constructor
+    and only ever produces a valid ``outcome``/``policy`` pair, so the coupling is a
+    tested invariant rather than a runtime guard.
+    """
+
+    outcome: EnsureTopicOutcome
+    policy: str | None
+
+
+class TopicConfigMismatchError(Exception):
+    """An existing topic's ``cleanup.policy`` isn't compacting and the caller chose
+    ``on_policy_mismatch='raise'``.
+
+    Raised ONLY on a confirmed mismatch, so ``topic``/``expected``/``actual`` are
+    always populated. The mismatch rule is set-containment of ``compact`` (not
+    string equality), so do not re-derive ``actual != expected``. Stands alone on
+    ``Exception``: the library raises stdlib exceptions elsewhere, so a ktables-wide
+    base would over-promise.
+    """
+
+    def __init__(self, topic: str, expected: str, actual: str) -> None:
+        self.topic = topic
+        self.expected = expected
+        self.actual = actual
+        super().__init__(f"topic {topic!r} cleanup.policy {actual!r} does not satisfy required {expected!r}")
+
+
+def _validate_policy_mismatch(on_policy_mismatch: str, ensure_topic: bool) -> None:
+    """Eagerly reject an invalid or inert ``on_policy_mismatch`` at construction.
+
+    The active values (``raise``/``reconcile``) cannot act when ``ensure_topic`` is
+    False (ktables then makes no admin calls), so the contradiction is made
+    unconstructible rather than a silent no-op.
+    """
+    if on_policy_mismatch not in ("ignore", "warn", "raise", "reconcile"):
+        raise ValueError(
+            f"on_policy_mismatch must be one of ignore/warn/raise/reconcile, got {on_policy_mismatch!r}"
+        )
+    if not ensure_topic and on_policy_mismatch in ("raise", "reconcile"):
+        raise ValueError(
+            f"on_policy_mismatch={on_policy_mismatch!r} needs ensure_topic=True: with ensure_topic=False "
+            "ktables makes no admin calls and cannot check the policy. Use ensure_topic=True to verify, "
+            "or manage cleanup.policy out-of-band."
+        )
+
+
 async def ensure_topic(
     bootstrap_servers: str,
     topic: str,
@@ -85,49 +392,44 @@ async def ensure_topic(
     num_partitions: int = 1,
     replication_factor: int = 1,
     topic_configs: Mapping[str, str] | None = None,
-) -> bool:
-    """Idempotently create ``topic`` with an explicit config.
+    on_policy_mismatch: PolicyMismatchAction = "warn",
+) -> EnsureTopicResult:
+    """Idempotently create ``topic`` with an explicit config, and (when it already
+    exists) check/reconcile its ``cleanup.policy`` per ``on_policy_mismatch``.
 
-    Returns True if this call created it, False if it already existed.
-    CreateTopics is atomic broker-side, so reader and writer racing to ensure
-    the same topic is benign — one wins, the other no-ops. This is the
-    EXPLICIT creation path; relying on broker auto-create is the bug (default
-    configs: cleanup.policy=delete), which this helper exists to make
-    unnecessary.
+    Returns an :class:`EnsureTopicResult` describing what happened. Whether the
+    topic already existed is read from the broker's IN-BAND ``create_topics``
+    response (``error_code=36``), not from an exception — a real broker does not
+    raise ``TopicAlreadyExistsError``. This is the EXPLICIT creation path; relying
+    on broker auto-create is the bug (default ``cleanup.policy=delete``), which this
+    helper exists to make unnecessary.
 
-    Any error other than already-exists (ACL denial, replication factor >
-    available brokers, broker unreachable) is logged with context and
-    re-raised — callers own retry/permission policy. The defaults
-    (1 partition, RF=1) are DEV-grade; production registries want RF>=3 with
-    min.insync.replicas=2 alongside an acks=all writer.
+    On an EXISTING topic whose declared policy compacts (the default), the response
+    depends on ``on_policy_mismatch``: ``ignore`` (skip the check), ``warn``
+    (default — log loudly, change nothing), ``raise``
+    (:class:`TopicConfigMismatchError`), or ``reconcile`` (safely flip to compact,
+    preserving other configs; needs the ``ALTER_CONFIGS`` ACL). A failed verify
+    propagates the broker error (``raise``/``reconcile``) or downgrades to ``INFO``
+    (``warn``). The defaults (1 partition, RF=1) are DEV-grade; production
+    registries want RF>=3 with min.insync.replicas=2 alongside an acks=all writer.
     """
     if num_partitions < 1 or replication_factor < 1:
         raise ValueError(f"num_partitions and replication_factor must be >= 1, got {num_partitions}/{replication_factor}")
+    # ensure_topic always creates, so the inert-combo arm is moot here; this rejects
+    # an unknown value before any admin call, so a typo can't fall through to reconcile.
+    _validate_policy_mismatch(on_policy_mismatch, ensure_topic=True)
+    effective = topic_configs if topic_configs is not None else DEFAULT_TOPIC_CONFIGS
+    expected = effective.get("cleanup.policy")
     admin = AIOKafkaAdminClient(bootstrap_servers=bootstrap_servers)
-    await admin.start()
     try:
-        await admin.create_topics(
-            [
-                NewTopic(
-                    name=topic,
-                    num_partitions=num_partitions,
-                    replication_factor=replication_factor,
-                    topic_configs=dict(topic_configs) if topic_configs is not None else dict(DEFAULT_TOPIC_CONFIGS),
-                )
-            ]
-        )
-        logger.info("created topic %s (partitions=%d, rf=%d)", topic, num_partitions, replication_factor)
-        return True
-    except TopicAlreadyExistsError:
-        logger.debug("topic %s already exists", topic)
-        return False
-    except Exception:
-        logger.exception(
-            "ensure_topic failed for topic=%s on %s (not an already-exists). If this process should not create topics, construct with ensure_topic=False.",  # noqa: E501
-            topic,
-            bootstrap_servers,
-        )
-        raise
+        # start() is inside the try so a failed connect still hits finally: close().
+        await admin.start()
+        created = await _try_create_topic(admin, topic, num_partitions, replication_factor, dict(effective))
+        if created:
+            return EnsureTopicResult("created", None)
+        if on_policy_mismatch == "ignore" or not _requires_compaction(expected):
+            return EnsureTopicResult("skipped", None)
+        return await _check_topic_policy(admin, topic, expected, on_policy_mismatch)
     finally:
         await admin.close()
 
@@ -183,6 +485,15 @@ class KafkaTable(Mapping[str, V]):
     A running table is a resource handle, not a value: equality is identity
     (two tables with momentarily equal contents are not "the same table").
     Not thread-safe; single event loop only. Reads before ``start()`` raise.
+
+    ``on_policy_mismatch`` controls what happens at ``start()`` when the topic
+    already exists with a non-compacting ``cleanup.policy``: an existing
+    ``cleanup.policy=delete`` topic silently EVICTS keys not re-written within its
+    retention window, so a fresh consumer can materialize a table missing entries.
+    ``warn`` (default) logs loudly and changes nothing; ``raise`` fails ``start()``;
+    ``reconcile`` flips the topic to compact (this MUTATES broker config and needs
+    the ``ALTER_CONFIGS`` ACL); ``ignore`` skips the check. See
+    :data:`PolicyMismatchAction`. Active values require ``ensure_topic=True``.
     """
 
     def __init__(
@@ -197,6 +508,7 @@ class KafkaTable(Mapping[str, V]):
         fetch_max_wait_ms: int = 500,
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
+        on_policy_mismatch: PolicyMismatchAction = "warn",
         on_set: Callable[[str, V], None] | None = None,
         on_delete: Callable[[str], None] | None = None,
     ) -> None:
@@ -208,6 +520,7 @@ class KafkaTable(Mapping[str, V]):
             raise TypeError("value_decoder and key_decoder must be callable")
         if (on_set is not None and not callable(on_set)) or (on_delete is not None and not callable(on_delete)):
             raise TypeError("on_set and on_delete must be callable")
+        _validate_policy_mismatch(on_policy_mismatch, ensure_topic)
         self._bootstrap_servers = bootstrap_servers
         self._topic = topic
         self._value_decoder = value_decoder
@@ -231,6 +544,7 @@ class KafkaTable(Mapping[str, V]):
         # Disable where the app lacks topic-create ACLs (see ensure_topic()).
         self._ensure_topic = ensure_topic
         self._topic_configs = dict(topic_configs) if topic_configs is not None else dict(DEFAULT_TOPIC_CONFIGS)
+        self._on_policy_mismatch = on_policy_mismatch
 
         self._live = _LiveStats()
         self._caught_up = asyncio.Event()
@@ -427,7 +741,12 @@ class KafkaTable(Mapping[str, V]):
         if self._started:
             raise RuntimeError(f"KafkaTable for topic={self._topic!r} already started")
         if self._ensure_topic:
-            await ensure_topic(self._bootstrap_servers, self._topic, topic_configs=self._topic_configs)
+            await ensure_topic(
+                self._bootstrap_servers,
+                self._topic,
+                topic_configs=self._topic_configs,
+                on_policy_mismatch=self._on_policy_mismatch,
+            )
         # Constructor topic + group_id=None: all partitions are assigned
         # synchronously inside start() — no group, no commits, no rebalance.
         # (Manual assign()+partitions_for_topic() hits a stale partition
@@ -643,6 +962,11 @@ class KafkaTableWriter(Generic[V]):
     The key encoder must be deterministic and stable across processes and
     versions — on a multi-partition topic, per-key LWW ordering holds only if
     a key always hashes to the same partition.
+
+    ``on_policy_mismatch`` behaves exactly as on :class:`KafkaTable`: at
+    ``start()`` it controls the response to an existing non-compacting topic
+    (``warn`` default / ``raise`` / ``reconcile`` — which mutates broker config and
+    needs the ``ALTER_CONFIGS`` ACL / ``ignore``). See :data:`PolicyMismatchAction`.
     """
 
     def __init__(
@@ -654,18 +978,21 @@ class KafkaTableWriter(Generic[V]):
         key_encoder: Callable[[str], bytes] = _utf8_encode,
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
+        on_policy_mismatch: PolicyMismatchAction = "warn",
         enable_idempotence: bool = True,
     ) -> None:
         if not bootstrap_servers or not topic:
             raise ValueError("bootstrap_servers and topic must be non-empty")
         if not callable(value_encoder) or not callable(key_encoder):
             raise TypeError("value_encoder and key_encoder must be callable")
+        _validate_policy_mismatch(on_policy_mismatch, ensure_topic)
         self._bootstrap_servers = bootstrap_servers
         self._topic = topic
         self._value_encoder = value_encoder
         self._key_encoder = key_encoder
         self._ensure_topic = ensure_topic
         self._topic_configs = dict(topic_configs) if topic_configs is not None else dict(DEFAULT_TOPIC_CONFIGS)
+        self._on_policy_mismatch = on_policy_mismatch
         self._enable_idempotence = enable_idempotence
         self._producer: AIOKafkaProducer | None = None
 
@@ -688,7 +1015,12 @@ class KafkaTableWriter(Generic[V]):
         if self._producer is not None:
             raise RuntimeError(f"KafkaTableWriter for topic={self._topic!r} already started")
         if self._ensure_topic:
-            await ensure_topic(self._bootstrap_servers, self._topic, topic_configs=self._topic_configs)
+            await ensure_topic(
+                self._bootstrap_servers,
+                self._topic,
+                topic_configs=self._topic_configs,
+                on_policy_mismatch=self._on_policy_mismatch,
+            )
         producer = AIOKafkaProducer(bootstrap_servers=self._bootstrap_servers, enable_idempotence=self._enable_idempotence)
         await producer.start()
         self._producer = producer

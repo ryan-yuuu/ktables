@@ -7,7 +7,7 @@ see the [README](../README.md).
 
 | Member | Description |
 |---|---|
-| `KafkaTable(*, bootstrap_servers, topic, value_decoder, key_decoder=utf-8, catchup_timeout=30.0, poll_timeout_ms=200, fetch_max_wait_ms=500, ensure_topic=True, topic_configs=None)` | Construct (does not connect). |
+| `KafkaTable(*, bootstrap_servers, topic, value_decoder, key_decoder=utf-8, catchup_timeout=30.0, poll_timeout_ms=200, fetch_max_wait_ms=500, ensure_topic=True, topic_configs=None, on_policy_mismatch="warn")` | Construct (does not connect). See [Topic-config reconciliation](#topic-config-reconciliation). |
 | `KafkaTable.json(*, bootstrap_servers, topic, model, **kwargs)` | Preset wiring `model.model_validate_json` as the decoder. |
 | `start()` / `stop()` / `async with` | Lifecycle. `start()` raises on double-start, missing topic, or reader death during catch-up; on catch-up *timeout* it serves degraded. |
 | `table[key]`, `key in table`, `iter`, `len`, `.get(key, default=None)` | Mapping reads. Raise `RuntimeError` before `start()`. |
@@ -25,7 +25,7 @@ resource handle, not a value.
 
 | Member | Description |
 |---|---|
-| `KafkaTableWriter(*, bootstrap_servers, topic, value_encoder, key_encoder=utf-8, ensure_topic=True, topic_configs=None, enable_idempotence=True)` | Construct. Idempotence implies `acks=all` (registry-grade durability); opt out for throwaway data. |
+| `KafkaTableWriter(*, bootstrap_servers, topic, value_encoder, key_encoder=utf-8, ensure_topic=True, topic_configs=None, on_policy_mismatch="warn", enable_idempotence=True)` | Construct. Idempotence implies `acks=all` (registry-grade durability); opt out for throwaway data. |
 | `KafkaTableWriter.json(*, bootstrap_servers, topic, model=None, **kwargs)` | Preset encoding via `model_dump_json()` (`model` is typing-only). |
 | `set(key, value)` | Keyed upsert; awaits broker ack. Re-`set` periodically as a heartbeat. |
 | `delete(key)` | Publishes a null-value tombstone; awaits broker ack. |
@@ -39,7 +39,7 @@ the same partition.
 
 | Member | Description |
 |---|---|
-| `GroupedKafkaTable(*, bootstrap_servers, topic, value_decoder, key_codec=DEFAULT_KEY_CODEC, catchup_timeout=30.0, poll_timeout_ms=200, fetch_max_wait_ms=500, ensure_topic=True, topic_configs=None)` | Construct (does not connect). |
+| `GroupedKafkaTable(*, bootstrap_servers, topic, value_decoder, key_codec=DEFAULT_KEY_CODEC, catchup_timeout=30.0, poll_timeout_ms=200, fetch_max_wait_ms=500, ensure_topic=True, topic_configs=None, on_policy_mismatch="warn")` | Construct (does not connect). |
 | `GroupedKafkaTable.json(*, bootstrap_servers, topic, model, key_codec=DEFAULT_KEY_CODEC, **kwargs)` | Preset wiring `model.model_validate_json`. |
 | `get_member(group, member) -> V \| None` / `has_member(group, member) -> bool` | Point lookups — O(1). |
 | `members(group) -> dict[str, V]` | One group's `{member: value}` map (a copy) — O(\|group\|). |
@@ -52,7 +52,7 @@ the same partition.
 
 | Member | Description |
 |---|---|
-| `GroupedKafkaTableWriter(*, bootstrap_servers, topic, value_encoder, key_codec=DEFAULT_KEY_CODEC, ensure_topic=True, topic_configs=None, enable_idempotence=True)` | Construct. |
+| `GroupedKafkaTableWriter(*, bootstrap_servers, topic, value_encoder, key_codec=DEFAULT_KEY_CODEC, ensure_topic=True, topic_configs=None, on_policy_mismatch="warn", enable_idempotence=True)` | Construct. |
 | `GroupedKafkaTableWriter.json(*, bootstrap_servers, topic, model=None, key_codec=DEFAULT_KEY_CODEC, **kwargs)` | Preset encoding via `model_dump_json()`. |
 | `set(group, member, value)` | Upsert one member (LWW per member); awaits broker ack. |
 | `delete(group, member)` | Tombstone one member; awaits broker ack. |
@@ -73,8 +73,23 @@ The reader and writer fix the key byte-layer at UTF-8 and expose only
 
 | Member | Description |
 |---|---|
-| `ensure_topic(bootstrap_servers, topic, *, num_partitions=1, replication_factor=1, topic_configs=None) -> bool` | Idempotent explicit create; `True` if this call created it. Defaults are dev-grade — production registries want RF≥3, `min.insync.replicas=2`, `acks=all`. |
+| `ensure_topic(bootstrap_servers, topic, *, num_partitions=1, replication_factor=1, topic_configs=None, on_policy_mismatch="warn") -> EnsureTopicResult` | Idempotent explicit create, plus the policy check/reconcile below. Defaults are dev-grade — production registries want RF≥3, `min.insync.replicas=2`, `acks=all`. |
 | `DEFAULT_TOPIC_CONFIGS` | `{"cleanup.policy": "compact"}` (read-only mapping). |
 | `ViewStats` | Frozen counters: `records_applied`, `tombstones_applied`, `keyless_records`, `key_decode_errors`, `value_decode_errors`, `catch_up_seconds`, `replayed_at_catch_up`. |
 | `SupportsJsonModel` | Protocol the `.json()` presets require (`model_dump_json` / `model_validate_json`). |
 | `TableStatus` | The `status` literal type. |
+
+## Topic-config reconciliation
+
+`on_policy_mismatch` (on every constructor and `ensure_topic`) governs the
+response when a topic **already exists** with a non-compacting `cleanup.policy` —
+a `delete` topic silently evicts un-refreshed keys, so a fresh consumer can
+materialize a table missing entries. Requires `ensure_topic=True`; pairing an
+active value with `ensure_topic=False` is a construction-time `ValueError`.
+
+| Member | Description |
+|---|---|
+| `PolicyMismatchAction` | Literal `"ignore" \| "warn" \| "raise" \| "reconcile"`. `warn` (default) logs and changes nothing; `raise` fails start with `TopicConfigMismatchError`; `reconcile` flips the topic to compact preserving other configs (needs `ALTER_CONFIGS`); `ignore` skips the check. |
+| `EnsureTopicResult` | Frozen `(outcome: EnsureTopicOutcome, policy: str \| None)` returned by `ensure_topic()`. `policy` is the observed policy for `verified`/`reconciled`/`mismatch` (pre-reconcile value for `reconciled`), else `None`. |
+| `EnsureTopicOutcome` | Literal `"created" \| "verified" \| "reconciled" \| "mismatch" \| "unreadable" \| "skipped"`. |
+| `TopicConfigMismatchError` | Raised by `raise` mode on a confirmed mismatch; carries `topic`, `expected`, `actual`. |

@@ -154,6 +154,37 @@ compacted). If the application lacks topic-create ACLs, pass
 `ensure_topic=False` and create the topic out-of-band (the module-level
 `ensure_topic()` function is the deploy-time primitive).
 
+### Existing-topic policy: `on_policy_mismatch`
+
+When the topic **already exists**, its `cleanup.policy` might not be `compact`
+(e.g. it was broker-auto-created as `delete`). A `delete` topic silently *evicts*
+keys not re-written within its retention window, so a fresh consumer can
+materialize a table **missing entries**. `on_policy_mismatch` controls the
+response at start:
+
+- **`warn`** (default) — log a loud warning, change nothing.
+- **`raise`** — fail `start()` with `TopicConfigMismatchError`.
+- **`reconcile`** — safely flip the topic to `compact`, preserving its other
+  configs (needs the `ALTER_CONFIGS` ACL).
+- **`ignore`** — skip the check entirely.
+
+```python
+# Production registries should opt into strict behavior:
+table = KafkaTable(..., on_policy_mismatch="raise")       # or "reconcile"
+```
+
+This knob **requires `ensure_topic=True`** (the check rides the same admin
+connection as the create). On a locked-down cluster where you set
+`ensure_topic=False`, ktables makes no admin calls — manage `cleanup.policy`
+out-of-band, and combining `ensure_topic=False` with `raise`/`reconcile` is a
+construction-time `ValueError`. If the cluster also denies `DESCRIBE`, prefer
+`ensure_topic=False` so the default `warn` doesn't emit a recurring
+"could not verify" line on every start.
+
+The standalone `ensure_topic()` returns an `EnsureTopicResult(outcome, policy)`
+for deploy/CI scripts (`outcome` ∈ `created`/`verified`/`reconciled`/`mismatch`/
+`unreadable`/`skipped`).
+
 <br>
 
 ## Consistency contract

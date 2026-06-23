@@ -200,6 +200,40 @@ class TestGroupedConstruction:
         assert default._table._fetch_max_wait_ms == 500
         assert custom._table._fetch_max_wait_ms == 10
 
+    def test_on_policy_mismatch_forwarded_to_inner_table(self) -> None:
+        default = GroupedKafkaTable(bootstrap_servers=BOOTSTRAP, topic="unit.grouped.opm", value_decoder=bytes)
+        custom = GroupedKafkaTable(
+            bootstrap_servers=BOOTSTRAP, topic="unit.grouped.opm", value_decoder=bytes, on_policy_mismatch="reconcile"
+        )
+        assert default._table._on_policy_mismatch == "warn"
+        assert custom._table._on_policy_mismatch == "reconcile"
+
+    def test_on_policy_mismatch_forwarded_to_inner_writer(self) -> None:
+        default = GroupedKafkaTableWriter(bootstrap_servers=BOOTSTRAP, topic="unit.grouped.opm", value_encoder=bytes)
+        custom = GroupedKafkaTableWriter(
+            bootstrap_servers=BOOTSTRAP, topic="unit.grouped.opm", value_encoder=bytes, on_policy_mismatch="reconcile"
+        )
+        assert default._writer._on_policy_mismatch == "warn"
+        assert custom._writer._on_policy_mismatch == "reconcile"
+
+    def test_inert_combo_rejected_via_inner_validation(self) -> None:
+        with pytest.raises(ValueError, match="ensure_topic=True"):
+            GroupedKafkaTable(
+                bootstrap_servers=BOOTSTRAP,
+                topic="unit.grouped.opm",
+                value_decoder=bytes,
+                ensure_topic=False,
+                on_policy_mismatch="raise",
+            )
+        with pytest.raises(ValueError, match="ensure_topic=True"):
+            GroupedKafkaTableWriter(
+                bootstrap_servers=BOOTSTRAP,
+                topic="unit.grouped.opm",
+                value_encoder=bytes,
+                ensure_topic=False,
+                on_policy_mismatch="reconcile",
+            )
+
 
 class TestGroupedUnstartedGuards:
     def test_reads_raise_before_start(self) -> None:
