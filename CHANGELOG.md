@@ -1,5 +1,16 @@
 # Changelog
 
+## [1.0.0](https://github.com/ryan-yuuu/ktables/compare/v0.4.0...v1.0.0) (2026-06-23)
+
+
+### ⚠ BREAKING CHANGES
+
+* reconcile existing topic cleanup.policy via on_policy_mismatch ([#25](https://github.com/ryan-yuuu/ktables/issues/25))
+
+### Features
+
+* reconcile existing topic cleanup.policy via on_policy_mismatch ([#25](https://github.com/ryan-yuuu/ktables/issues/25)) ([769820a](https://github.com/ryan-yuuu/ktables/commit/769820ad1ee84a987697400ca123f12e34a2ffa4))
+
 ## [0.4.0](https://github.com/ryan-yuuu/ktables/compare/v0.3.0...v0.4.0) (2026-06-20)
 
 
