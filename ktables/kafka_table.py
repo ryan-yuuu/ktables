@@ -955,9 +955,11 @@ class KafkaTableWriter(Generic[V]):
     LWW upsert); ``delete(key)`` publishes a null-value tombstone. A periodic
     re-``set`` of the same value is a heartbeat — no separate API needed.
 
-    Registry-grade durability by default: ``enable_idempotence=True`` (which
-    implies ``acks=all``), so a leader failover can't drop an acked record and
-    producer retries can't duplicate or reorder. Opt out for throwaway data.
+    At-least-once by default: ``enable_idempotence=False``, so producer retries
+    may duplicate or reorder records and a leader failover can drop an acked
+    write. Opt in with ``enable_idempotence=True`` for registry-grade
+    durability — that implies ``acks=all``, so a leader failover can't drop an
+    acked record and retries can't duplicate or reorder.
 
     The key encoder must be deterministic and stable across processes and
     versions — on a multi-partition topic, per-key LWW ordering holds only if
@@ -979,7 +981,7 @@ class KafkaTableWriter(Generic[V]):
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
         on_policy_mismatch: PolicyMismatchAction = "warn",
-        enable_idempotence: bool = True,
+        enable_idempotence: bool = False,
     ) -> None:
         if not bootstrap_servers or not topic:
             raise ValueError("bootstrap_servers and topic must be non-empty")

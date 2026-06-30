@@ -140,6 +140,19 @@ class TestFetchMaxWait:
         assert table._fetch_max_wait_ms == 10
 
 
+class TestEnableIdempotence:
+    """Idempotence is opt-in: the producer defaults to at-least-once (may
+    duplicate/reorder). Turning it on implies acks=all — registry-grade
+    durability (see the KafkaTableWriter class docstring)."""
+
+    def test_defaults_to_false(self) -> None:
+        assert make_writer("unit.idem")._enable_idempotence is False
+
+    def test_explicit_true_is_honored(self) -> None:
+        writer = KafkaTableWriter(bootstrap_servers="b", topic="t", value_encoder=bytes, enable_idempotence=True)
+        assert writer._enable_idempotence is True
+
+
 class TestUnstartedGuards:
     def test_reads_raise_before_start(self) -> None:
         table = make_table("unit.never.started")
