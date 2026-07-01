@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.1.0](https://github.com/ryan-yuuu/ktables/compare/v1.0.0...v1.1.0) (2026-07-01)
+
+
+### Features
+
+* at-least-once producer default and acks durability knob ([#28](https://github.com/ryan-yuuu/ktables/issues/28)) ([109d2e1](https://github.com/ryan-yuuu/ktables/commit/109d2e1e1cff702b25720b2e6e6d61baba8cc578))
+
 ## [1.0.0](https://github.com/ryan-yuuu/ktables/compare/v0.4.0...v1.0.0) (2026-06-23)
 
 
