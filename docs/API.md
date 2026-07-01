@@ -25,7 +25,7 @@ resource handle, not a value.
 
 | Member | Description |
 |---|---|
-| `KafkaTableWriter(*, bootstrap_servers, topic, value_encoder, key_encoder=utf-8, ensure_topic=True, topic_configs=None, on_policy_mismatch="warn", enable_idempotence=False)` | Construct. At-least-once by default (may duplicate/reorder); opt in with `enable_idempotence=True` for `acks=all` registry-grade durability. |
+| `KafkaTableWriter(*, bootstrap_servers, topic, value_encoder, key_encoder=utf-8, ensure_topic=True, topic_configs=None, on_policy_mismatch="warn", enable_idempotence=False, acks=None)` | Construct. At-least-once by default (may duplicate/reorder); opt in with `enable_idempotence=True` for `acks=all` registry-grade durability. `acks` (`0`/`1`/`"all"`, default unset) independently tunes ack durability — set `acks="all"` for ISR acks without idempotence. |
 | `KafkaTableWriter.json(*, bootstrap_servers, topic, model=None, **kwargs)` | Preset encoding via `model_dump_json()` (`model` is typing-only). |
 | `set(key, value)` | Keyed upsert; awaits broker ack. Re-`set` periodically as a heartbeat. |
 | `delete(key)` | Publishes a null-value tombstone; awaits broker ack. |
@@ -52,7 +52,7 @@ the same partition.
 
 | Member | Description |
 |---|---|
-| `GroupedKafkaTableWriter(*, bootstrap_servers, topic, value_encoder, key_codec=DEFAULT_KEY_CODEC, ensure_topic=True, topic_configs=None, on_policy_mismatch="warn", enable_idempotence=False)` | Construct. |
+| `GroupedKafkaTableWriter(*, bootstrap_servers, topic, value_encoder, key_codec=DEFAULT_KEY_CODEC, ensure_topic=True, topic_configs=None, on_policy_mismatch="warn", enable_idempotence=False, acks=None)` | Construct. |
 | `GroupedKafkaTableWriter.json(*, bootstrap_servers, topic, model=None, key_codec=DEFAULT_KEY_CODEC, **kwargs)` | Preset encoding via `model_dump_json()`. |
 | `set(group, member, value)` | Upsert one member (LWW per member); awaits broker ack. |
 | `delete(group, member)` | Tombstone one member; awaits broker ack. |

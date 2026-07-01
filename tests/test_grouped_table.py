@@ -224,6 +224,14 @@ class TestGroupedConstruction:
         assert default._writer._enable_idempotence is False
         assert custom._writer._enable_idempotence is True
 
+    def test_acks_forwarded_to_inner_writer(self) -> None:
+        default = GroupedKafkaTableWriter(bootstrap_servers=BOOTSTRAP, topic="unit.grouped.acks", value_encoder=bytes)
+        custom = GroupedKafkaTableWriter(
+            bootstrap_servers=BOOTSTRAP, topic="unit.grouped.acks", value_encoder=bytes, acks="all"
+        )
+        assert default._writer._acks is None
+        assert custom._writer._acks == "all"
+
     def test_inert_combo_rejected_via_inner_validation(self) -> None:
         with pytest.raises(ValueError, match="ensure_topic=True"):
             GroupedKafkaTable(
