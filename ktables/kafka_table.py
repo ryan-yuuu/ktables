@@ -73,6 +73,12 @@ describe, log loudly on a confirmed mismatch, change nothing), ``raise``
 (:class:`TopicConfigMismatchError`), ``reconcile`` (safely flip to compact,
 preserving other configs)."""
 
+AcksSetting = Literal[0, 1, "all"]
+"""Producer ack durability: ``0`` (fire-and-forget), ``1`` (leader only), ``all``
+(leader + in-sync replicas). Passed through to the producer when set; leaving it
+unset defers to aiokafka's default — ``acks=1``, or ``acks=all`` forced under
+``enable_idempotence=True``."""
+
 EnsureTopicOutcome = Literal["created", "verified", "reconciled", "mismatch", "unreadable", "skipped"]
 """What :func:`ensure_topic` did, when the topic ALREADY existed unless ``created``:
 ``created`` (this call made it, compacted), ``verified`` (existed & compacting),
@@ -955,9 +961,16 @@ class KafkaTableWriter(Generic[V]):
     LWW upsert); ``delete(key)`` publishes a null-value tombstone. A periodic
     re-``set`` of the same value is a heartbeat — no separate API needed.
 
-    Registry-grade durability by default: ``enable_idempotence=True`` (which
-    implies ``acks=all``), so a leader failover can't drop an acked record and
-    producer retries can't duplicate or reorder. Opt out for throwaway data.
+    At-least-once by default: ``enable_idempotence=False``, so producer retries
+    may duplicate or reorder records and a leader failover can drop an acked
+    write. Opt in with ``enable_idempotence=True`` for registry-grade
+    durability — that implies ``acks=all``, so a leader failover can't drop an
+    acked record and retries can't duplicate or reorder.
+
+    ``acks`` independently tunes ack durability (:data:`AcksSetting`). Leave it
+    unset to inherit the default implied above, or set ``acks="all"`` to require
+    in-sync-replica acks *without* idempotence — e.g. against brokers that lack
+    idempotent-producer support.
 
     The key encoder must be deterministic and stable across processes and
     versions — on a multi-partition topic, per-key LWW ordering holds only if
@@ -979,7 +992,8 @@ class KafkaTableWriter(Generic[V]):
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
         on_policy_mismatch: PolicyMismatchAction = "warn",
-        enable_idempotence: bool = True,
+        enable_idempotence: bool = False,
+        acks: AcksSetting | None = None,
     ) -> None:
         if not bootstrap_servers or not topic:
             raise ValueError("bootstrap_servers and topic must be non-empty")
@@ -994,6 +1008,7 @@ class KafkaTableWriter(Generic[V]):
         self._topic_configs = dict(topic_configs) if topic_configs is not None else dict(DEFAULT_TOPIC_CONFIGS)
         self._on_policy_mismatch = on_policy_mismatch
         self._enable_idempotence = enable_idempotence
+        self._acks = acks
         self._producer: AIOKafkaProducer | None = None
 
     def __repr__(self) -> str:
@@ -1021,7 +1036,14 @@ class KafkaTableWriter(Generic[V]):
                 topic_configs=self._topic_configs,
                 on_policy_mismatch=self._on_policy_mismatch,
             )
-        producer = AIOKafkaProducer(bootstrap_servers=self._bootstrap_servers, enable_idempotence=self._enable_idempotence)
+        # acks unset (None) is omitted so aiokafka applies its own default
+        # (acks=1, or acks=all forced under enable_idempotence).
+        optional_kwargs: dict[str, object] = {} if self._acks is None else {"acks": self._acks}
+        producer = AIOKafkaProducer(
+            bootstrap_servers=self._bootstrap_servers,
+            enable_idempotence=self._enable_idempotence,
+            **optional_kwargs,
+        )
         await producer.start()
         self._producer = producer
 

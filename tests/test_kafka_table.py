@@ -140,6 +140,62 @@ class TestFetchMaxWait:
         assert table._fetch_max_wait_ms == 10
 
 
+class TestEnableIdempotence:
+    """Idempotence is opt-in: the producer defaults to at-least-once (may
+    duplicate/reorder). Turning it on implies acks=all — registry-grade
+    durability (see the KafkaTableWriter class docstring)."""
+
+    def test_defaults_to_false(self) -> None:
+        assert make_writer("unit.idem")._enable_idempotence is False
+
+    def test_explicit_true_is_honored(self) -> None:
+        writer = KafkaTableWriter(bootstrap_servers="b", topic="t", value_encoder=bytes, enable_idempotence=True)
+        assert writer._enable_idempotence is True
+
+
+def _capture_producer(sink: dict) -> type:
+    """A stand-in AIOKafkaProducer that records its construction kwargs."""
+
+    class _FakeProducer:
+        def __init__(self, **kwargs: object) -> None:
+            sink.update(kwargs)
+
+        async def start(self) -> None:
+            pass
+
+        async def stop(self) -> None:
+            pass
+
+    return _FakeProducer
+
+
+class TestAcks:
+    """acks is an opt-in producer knob: unset (None) defers to aiokafka's
+    default (acks=1, or acks=all under enable_idempotence); a set value passes
+    straight through to the producer."""
+
+    def test_defaults_to_none(self) -> None:
+        assert make_writer("unit.acks")._acks is None
+
+    def test_explicit_value_is_stored(self) -> None:
+        writer = KafkaTableWriter(bootstrap_servers="b", topic="t", value_encoder=bytes, acks="all")
+        assert writer._acks == "all"
+
+    async def test_set_acks_reaches_the_producer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+        monkeypatch.setattr("ktables.kafka_table.AIOKafkaProducer", _capture_producer(captured))
+        writer = KafkaTableWriter(bootstrap_servers="b", topic="t", value_encoder=bytes, ensure_topic=False, acks="all")
+        await writer.start()
+        assert captured["acks"] == "all"
+
+    async def test_unset_acks_is_omitted_from_producer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+        monkeypatch.setattr("ktables.kafka_table.AIOKafkaProducer", _capture_producer(captured))
+        writer = KafkaTableWriter(bootstrap_servers="b", topic="t", value_encoder=bytes, ensure_topic=False)
+        await writer.start()
+        assert "acks" not in captured
+
+
 class TestUnstartedGuards:
     def test_reads_raise_before_start(self) -> None:
         table = make_table("unit.never.started")

@@ -14,6 +14,7 @@ from ktables.grouped_table import (
     LengthPrefixedKeyCodec,
 )
 from ktables.kafka_table import (
+    AcksSetting,
     DEFAULT_TOPIC_CONFIGS,
     EnsureTopicOutcome,
     EnsureTopicResult,
@@ -28,6 +29,7 @@ from ktables.kafka_table import (
 )
 
 __all__ = [
+    "AcksSetting",
     "CompositeKeyCodec",
     "DEFAULT_KEY_CODEC",
     "DEFAULT_TOPIC_CONFIGS",

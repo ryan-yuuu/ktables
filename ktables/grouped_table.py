@@ -30,6 +30,7 @@ if TYPE_CHECKING:
     from typing_extensions import Self
 
 from ktables.kafka_table import (
+    AcksSetting,
     KafkaTable,
     KafkaTableWriter,
     PolicyMismatchAction,
@@ -322,8 +323,9 @@ class GroupedKafkaTableWriter(Generic[V]):
     publishes ``value`` under ``encode(group, member)`` (a per-member LWW upsert)
     and ``delete(group, member)`` tombstones that one key. Because every
     ``(group, member)`` is a distinct key, independent writers never share a key:
-    no read-modify-write, no lost update. Registry-grade durability
-    (``enable_idempotence`` implies ``acks=all``) and lifecycle are the inner writer's.
+    no read-modify-write, no lost update. Durability (``enable_idempotence`` off
+    by default; ``True`` implies ``acks=all``), the ``acks`` override, and
+    lifecycle are the inner writer's.
 
     ``on_policy_mismatch`` forwards to the inner writer unchanged — see
     :class:`~ktables.kafka_table.KafkaTable`.
@@ -339,7 +341,8 @@ class GroupedKafkaTableWriter(Generic[V]):
         ensure_topic: bool = True,
         topic_configs: Mapping[str, str] | None = None,
         on_policy_mismatch: PolicyMismatchAction = "warn",
-        enable_idempotence: bool = True,
+        enable_idempotence: bool = False,
+        acks: AcksSetting | None = None,
     ) -> None:
         self._codec = key_codec
         self._topic = topic
@@ -353,6 +356,7 @@ class GroupedKafkaTableWriter(Generic[V]):
             topic_configs=topic_configs,
             on_policy_mismatch=on_policy_mismatch,
             enable_idempotence=enable_idempotence,
+            acks=acks,
         )
 
     @classmethod
